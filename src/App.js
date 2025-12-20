@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { initializeApp, getApps, getApp } from 'firebase/app'; 
+import { initializeApp } from 'firebase/app';
 import { 
   getFirestore, 
   collection, 
@@ -15,6 +15,7 @@ import {
 } from 'firebase/firestore';
 import { 
   getAuth, 
+  signInWithCustomToken, 
   signInAnonymously, 
   onAuthStateChanged 
 } from 'firebase/auth';
@@ -52,9 +53,10 @@ import {
 } from 'lucide-react';
 
 // ==========================================
-// 1. KONFIGURATION
+// 1. KONFIGURATION (Robust mit Fallback)
 // ==========================================
 
+// Deine manuelle Config als Sicherung
 const manualConfig = {
   apiKey: "AIzaSyD7iO59TiZVG8vhHpapmpO-IHID8jX_dzE",
   authDomain: "specialized-4b4c4.firebaseapp.com",
@@ -63,6 +65,30 @@ const manualConfig = {
   messagingSenderId: "610305729554",
   appId: "1:610305729554:web:081b81ebb26dbf57e7a4cb"
 };
+
+let app, auth, db, configError;
+
+try {
+  let firebaseConfig;
+  
+  // Prüfen, ob die automatische Variable existiert
+  if (typeof __firebase_config !== 'undefined') {
+    firebaseConfig = JSON.parse(__firebase_config);
+  } else {
+    // Fallback auf manuelle Config, wenn Variable fehlt
+    console.warn("Nutze manuelle Firebase Konfiguration.");
+    firebaseConfig = manualConfig;
+  }
+
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
+} catch (e) {
+  console.error("Firebase Init Error:", e);
+  configError = e.message;
+}
+
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
 // ==========================================
 // 2. HEADER GRAFIK
@@ -101,36 +127,6 @@ function HeaderGraphic() {
 }
 
 // ==========================================
-// SICHERE INITIALISIERUNG
-// ==========================================
-
-let app = null;
-let auth = null;
-let db = null;
-let initError = null;
-
-const appId = 'knobel-verein-app-v1';
-
-try {
-  if (manualConfig) {
-    if (getApps().length === 0) {
-      app = initializeApp(manualConfig);
-    } else {
-      app = getApp();
-    }
-    
-    auth = getAuth(app);
-    db = getFirestore(app);
-  } else {
-    // Nur wenn WIRKLICH keine Config da ist (sollte hier nicht passieren)
-    console.warn("Keine Firebase Config gefunden.");
-  }
-} catch (e) {
-  console.error("Init Fehler:", e);
-  initError = e.message;
-}
-
-// ==========================================
 // ERROR BOUNDARY
 // ==========================================
 class ErrorBoundary extends React.Component {
@@ -146,7 +142,7 @@ class ErrorBoundary extends React.Component {
         <div className="p-6 bg-red-50 text-red-900 h-screen flex flex-col items-center justify-center text-center font-sans">
           <AlertCircle className="w-12 h-12 mb-4 text-red-600" />
           <h1 className="text-xl font-bold mb-2">Ein Fehler ist aufgetreten</h1>
-          <p className="mb-4 text-sm">Bitte laden Sie die Seite neu.</p>
+          <p className="mb-4 text-sm bg-red-100 p-2 rounded font-mono">{this.state.error?.message || "Unbekannter Fehler"}</p>
           <button onClick={() => window.location.reload()} className="bg-red-600 text-white px-6 py-3 rounded-lg font-bold">Neu laden</button>
         </div>
       );
@@ -160,7 +156,7 @@ class ErrorBoundary extends React.Component {
 // ==========================================
 
 function KnobelKasse() {
-  if (initError) throw new Error("Initialisierungsfehler: " + initError);
+  if (configError) throw new Error("Initialisierungsfehler: " + configError);
 
   const [user, setUser] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -179,36 +175,32 @@ function KnobelKasse() {
   const [history, setHistory] = useState([]);
   const [pot, setPot] = useState({ balance: 0 });
 
-  // Auth Init
+  // 1. AUTHENTIFIZIERUNG
   useEffect(() => {
-    // Wenn keine Config da ist, Fehler anzeigen statt Demo
-    if (!auth || !db) {
-      setConnectionError("Konfigurationsfehler: Firebase nicht initialisiert.");
-      return;
-    }
     const initAuth = async () => {
       try {
-        await signInAnonymously(auth);
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
       } catch (err) {
         console.error("Auth fehlgeschlagen:", err);
-        // Fehler anzeigen, NICHT in Demo wechseln
-        if (err.code === 'auth/operation-not-allowed') {
-            setConnectionError("FEHLER: 'Anonyme Anmeldung' ist in der Firebase Console noch deaktiviert!");
-        } else {
-            setConnectionError(`Anmeldefehler: ${err.message}`);
-        }
+        setConnectionError(`Anmeldefehler: ${err.message}`);
+        setIsDemo(true);
       }
     };
     initAuth();
+    
     return onAuthStateChanged(auth, (u) => {
         if (u) {
             setUser(u);
-            setConnectionError(null); // Fehler löschen bei Erfolg
+            setConnectionError(null);
         }
     });
   }, []);
 
-  // Data Loading
+  // 2. Data Loading (Private User Paths)
   useEffect(() => {
     if (!user && !isDemo) return;
 
@@ -232,14 +224,13 @@ function KnobelKasse() {
 
     if (!db) return;
 
+    // HELPER: Pfad auf User-ID umgebogen
     const getSafeCol = (colName) => {
-        if (!db) return null;
-        return manualConfig ? collection(db, colName) : collection(db, 'artifacts', appId, 'public', 'data', colName);
+        return collection(db, 'artifacts', appId, 'users', user.uid, colName);
     }
 
-    const safeSnapshot = (colName, setter, limitCount = null) => {
+    const safeSnapshot = (colName, setter) => {
       const colRef = getSafeCol(colName);
-      if (!colRef) return () => {};
       
       return onSnapshot(colRef, (snap) => {
           const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -260,14 +251,7 @@ function KnobelKasse() {
         },
         (err) => {
             console.error(`Ladefehler ${colName}:`, err);
-            // STRENGER MODUS: Fehler anzeigen statt Demo
-            if (err.code === 'permission-denied') {
-                setConnectionError("DATENBANK-FEHLER: Zugriff verweigert. Haben Sie 'Firestore Database' erstellt und 'Testmodus' gewählt?");
-            } else if (err.code === 'unavailable') {
-                setConnectionError("Verbindung unterbrochen (Offline).");
-            } else {
-                setConnectionError(`Datenbankfehler: ${err.message}`);
-            }
+            setConnectionError(`Datenbankfehler (${colName}): ${err.message}`);
         }
       );
     };
@@ -288,14 +272,8 @@ function KnobelKasse() {
   }, [user, isDemo]);
 
   // Helpers for Paths
-  const getCol = (name) => {
-      if (!db) return null;
-      return manualConfig ? collection(db, name) : collection(db, 'artifacts', appId, 'public', 'data', name);
-  };
-  const getDocRef = (name, id) => {
-      if (!db) return null;
-      return manualConfig ? doc(db, name, id) : doc(db, 'artifacts', appId, 'public', 'data', name, id);
-  };
+  const getCol = (name) => collection(db, 'artifacts', appId, 'users', user.uid, name);
+  const getDocRef = (name, id) => doc(db, 'artifacts', appId, 'users', user.uid, name, id);
 
   // ACTIONS
   const bookPenalty = async (memberId, memberName, penaltyTitle, amount, catalogId) => {
@@ -307,16 +285,19 @@ function KnobelKasse() {
     }
     if (!user || !db) return;
 
-    const memRef = getDocRef('knobel_members', memberId);
-    const histCol = getCol('knobel_history');
-    if (!memRef || !histCol) return;
+    try {
+      const memRef = getDocRef('knobel_members', memberId);
+      const histCol = getCol('knobel_history');
 
-    await updateDoc(memRef, { debt: increment(amount) });
-    if (catalogId) {
-        const catRef = getDocRef('knobel_catalog', catalogId);
-        if(catRef) await updateDoc(catRef, { count: increment(1) });
+      await updateDoc(memRef, { debt: increment(amount) });
+      if (catalogId) {
+          const catRef = getDocRef('knobel_catalog', catalogId);
+          await updateDoc(catRef, { count: increment(1) });
+      }
+      await addDoc(histCol, { text: `${memberName}: ${penaltyTitle}`, amount, type: 'penalty', createdAt: serverTimestamp() });
+    } catch (e) {
+      console.error("Fehler beim Buchen:", e);
     }
-    await addDoc(histCol, { text: `${memberName}: ${penaltyTitle}`, amount, type: 'penalty', createdAt: serverTimestamp() });
   };
 
   const payDebt = async (memberId, memberName, amount) => {
@@ -328,15 +309,17 @@ function KnobelKasse() {
     }
     if (!user || !db) return;
 
-    const memRef = getDocRef('knobel_members', memberId);
-    const potRef = getDocRef('knobel_pot', 'main');
-    const histCol = getCol('knobel_history');
-    
-    if (!memRef || !potRef || !histCol) return;
-
-    await updateDoc(memRef, { debt: increment(-amount) });
-    await setDoc(potRef, { balance: increment(amount) }, { merge: true });
-    await addDoc(histCol, { text: `${memberName} hat eingezahlt`, amount: -amount, type: 'payment', createdAt: serverTimestamp() });
+    try {
+      const memRef = getDocRef('knobel_members', memberId);
+      const potRef = getDocRef('knobel_pot', 'main');
+      const histCol = getCol('knobel_history');
+      
+      await updateDoc(memRef, { debt: increment(-amount) });
+      await setDoc(potRef, { balance: increment(amount) }, { merge: true });
+      await addDoc(histCol, { text: `${memberName} hat eingezahlt`, amount: -amount, type: 'payment', createdAt: serverTimestamp() });
+    } catch (e) {
+      console.error("Fehler beim Zahlen:", e);
+    }
   };
 
   const bookExpense = async (title, amount) => {
@@ -347,12 +330,15 @@ function KnobelKasse() {
       }
       if (!user || !db) return;
 
-      const potRef = getDocRef('knobel_pot', 'main');
-      const histCol = getCol('knobel_history');
-      if (!potRef || !histCol) return;
+      try {
+        const potRef = getDocRef('knobel_pot', 'main');
+        const histCol = getCol('knobel_history');
 
-      await setDoc(potRef, { balance: increment(-amount) }, { merge: true });
-      await addDoc(histCol, { text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: serverTimestamp() });
+        await setDoc(potRef, { balance: increment(-amount) }, { merge: true });
+        await addDoc(histCol, { text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: serverTimestamp() });
+      } catch (e) {
+        console.error("Fehler bei Ausgabe:", e);
+      }
   }
 
   // Demo Helpers
@@ -380,7 +366,7 @@ function KnobelKasse() {
   // Views
   const totalDebt = members.reduce((acc, m) => acc + (m.debt || 0), 0);
 
-  if (!user && !connectionError) return <div className="flex h-screen items-center justify-center bg-slate-900 text-white"><p className="animate-pulse">Lade Specialized-App...</p></div>;
+  if (!user && !connectionError && !isDemo) return <div className="flex h-screen items-center justify-center bg-slate-900 text-white"><p className="animate-pulse">Lade Specialized-App...</p></div>;
 
   return (
     <div className="flex flex-col h-screen bg-slate-50 font-sans text-slate-800 w-full relative overflow-hidden">
@@ -418,9 +404,9 @@ function KnobelKasse() {
         <div className="max-w-2xl mx-auto w-full">
           {activeTab === 'dashboard' && <DashboardView members={members} history={history} totalDebt={totalDebt} pot={pot} onExpense={bookExpense} catalog={catalog} isAdmin={isAdmin} />}
           {activeTab === 'kasse' && <CashierView members={members} catalog={catalog} onBook={bookPenalty} onPay={payDebt} />}
-          {activeTab === 'members' && <MembersView members={members} onPay={payDebt} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('members', i)} onDemoDelete={(id)=>deleteDemoItem('members', id)} manualConfig={manualConfig} isAdmin={isAdmin} />}
-          {activeTab === 'settings' && <CatalogView catalog={catalog} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('catalog', i)} onDemoDelete={(id)=>deleteDemoItem('catalog', id)} manualConfig={manualConfig} isAdmin={isAdmin} />}
-          {activeTab === 'calendar' && <CalendarView events={events} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('events', i)} onDemoDelete={(id)=>deleteDemoItem('events', id)} manualConfig={manualConfig} isAdmin={isAdmin} />}
+          {activeTab === 'members' && <MembersView members={members} onPay={payDebt} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('members', i)} onDemoDelete={(id)=>deleteDemoItem('members', id)} isAdmin={isAdmin} />}
+          {activeTab === 'settings' && <CatalogView catalog={catalog} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('catalog', i)} onDemoDelete={(id)=>deleteDemoItem('catalog', id)} isAdmin={isAdmin} />}
+          {activeTab === 'calendar' && <CalendarView events={events} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('events', i)} onDemoDelete={(id)=>deleteDemoItem('events', id)} isAdmin={isAdmin} />}
         </div>
       </main>
 
@@ -810,7 +796,7 @@ function CashierView({ members, catalog, onBook, onPay }) {
   );
 }
 
-function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelete, manualConfig, isAdmin }) {
+function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelete, isAdmin }) {
   const [payModal, setPayModal] = useState(null);
   const [payAmount, setPayAmount] = useState('');
   const [newMemberName, setNewMemberName] = useState('');
@@ -822,9 +808,9 @@ function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelet
     if(!newMemberName.trim()) return;
     if (isDemo) onDemoAdd({ name: newMemberName });
     else {
-        // Safe check
-        const col = manualConfig ? collection(db, 'knobel_members') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_members');
-        if(col) await addDoc(col, { name: newMemberName, debt: 0, createdAt: serverTimestamp() });
+        // Korrigierter Pfad: Private User Data
+        const col = collection(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'knobel_members');
+        await addDoc(col, { name: newMemberName, debt: 0, createdAt: serverTimestamp() });
     }
     setNewMemberName(''); setShowAdd(false);
   };
@@ -832,9 +818,9 @@ function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelet
   const deleteMember = async (id) => {
     if (isDemo) onDemoDelete(id);
     else {
-        // Safe check
-        const docRef = manualConfig ? doc(db, 'knobel_members', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_members', id);
-        if(docRef) await deleteDoc(docRef);
+        // Korrigierter Pfad
+        const docRef = doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'knobel_members', id);
+        await deleteDoc(docRef);
     }
     setDeleteId(null);
   };
@@ -927,7 +913,7 @@ function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelet
   );
 }
 
-function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, manualConfig, isAdmin }) {
+function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, isAdmin }) {
     const [title, setTitle] = useState('');
     const [amount, setAmount] = useState('');
     const [delId, setDelId] = useState(null);
@@ -937,9 +923,8 @@ function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, manu
         if(!title || !amount) return;
         if (isDemo) onDemoAdd({ title, amount: parseFloat(amount) });
         else {
-            // Safe check
-            const col = manualConfig ? collection(db, 'knobel_catalog') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog');
-            if(col) await addDoc(col, { title, amount: parseFloat(amount), createdAt: serverTimestamp(), count: 0 });
+            const col = collection(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'knobel_catalog');
+            await addDoc(col, { title, amount: parseFloat(amount), createdAt: serverTimestamp(), count: 0 });
         }
         setTitle(''); setAmount('');
     };
@@ -947,9 +932,8 @@ function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, manu
     const del = async (id) => { 
       if (isDemo) onDemoDelete(id);
       else {
-          // Safe check
-          const docRef = manualConfig ? doc(db, 'knobel_catalog', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog', id);
-          if(docRef) await deleteDoc(docRef); 
+          const docRef = doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'knobel_catalog', id);
+          await deleteDoc(docRef); 
       }
       setDelId(null); 
     };
@@ -991,7 +975,7 @@ function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, manu
     );
 }
 
-function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, manualConfig, isAdmin }) {
+function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, isAdmin }) {
     const [date, setDate] = useState('');
     const [time, setTime] = useState('');
     const [loc, setLoc] = useState('');
@@ -1001,9 +985,8 @@ function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, manu
         e.preventDefault(); if(!date) return;
         if (isDemo) onDemoAdd({ date, time, location: loc });
         else {
-            // Safe check
-            const col = manualConfig ? collection(db, 'knobel_events') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_events');
-            if(col) await addDoc(col, { date, time, location: loc, createdAt: serverTimestamp() });
+            const col = collection(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'knobel_events');
+            await addDoc(col, { date, time, location: loc, createdAt: serverTimestamp() });
         }
         setDate(''); setTime(''); setLoc('');
     };
@@ -1011,9 +994,8 @@ function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, manu
     const del = async (id) => { 
       if (isDemo) onDemoDelete(id);
       else {
-          // Safe check
-          const docRef = manualConfig ? doc(db, 'knobel_events', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_events', id);
-          if(docRef) await deleteDoc(docRef); 
+          const docRef = doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'knobel_events', id);
+          await deleteDoc(docRef); 
       }
       setDelId(null); 
     };
