@@ -46,7 +46,9 @@ import {
   PenTool,
   Dices,
   Crown,
-  Flame
+  Flame,
+  Wifi,
+  WifiOff
 } from 'lucide-react';
 
 // ==========================================
@@ -120,7 +122,8 @@ try {
     auth = getAuth(app);
     db = getFirestore(app);
   } else {
-    console.warn("Keine Firebase Config - Demo Modus.");
+    // Nur wenn WIRKLICH keine Config da ist (sollte hier nicht passieren)
+    console.warn("Keine Firebase Config gefunden.");
   }
 } catch (e) {
   console.error("Init Fehler:", e);
@@ -162,6 +165,7 @@ function KnobelKasse() {
   const [user, setUser] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isDemo, setIsDemo] = useState(false);
+  const [connectionError, setConnectionError] = useState(null); 
   
   // Admin State
   const [isAdmin, setIsAdmin] = useState(false);
@@ -177,9 +181,9 @@ function KnobelKasse() {
 
   // Auth Init
   useEffect(() => {
+    // Wenn keine Config da ist, Fehler anzeigen statt Demo
     if (!auth || !db) {
-      setIsDemo(true);
-      setUser({ uid: 'demo-user', isAnonymous: true });
+      setConnectionError("Konfigurationsfehler: Firebase nicht initialisiert.");
       return;
     }
     const initAuth = async () => {
@@ -187,17 +191,26 @@ function KnobelKasse() {
         await signInAnonymously(auth);
       } catch (err) {
         console.error("Auth fehlgeschlagen:", err);
-        setIsDemo(true);
-        setUser({ uid: 'demo-fallback' });
+        // Fehler anzeigen, NICHT in Demo wechseln
+        if (err.code === 'auth/operation-not-allowed') {
+            setConnectionError("FEHLER: 'Anonyme Anmeldung' ist in der Firebase Console noch deaktiviert!");
+        } else {
+            setConnectionError(`Anmeldefehler: ${err.message}`);
+        }
       }
     };
     initAuth();
-    return onAuthStateChanged(auth, setUser);
+    return onAuthStateChanged(auth, (u) => {
+        if (u) {
+            setUser(u);
+            setConnectionError(null); // Fehler löschen bei Erfolg
+        }
+    });
   }, []);
 
   // Data Loading
   useEffect(() => {
-    if (!user) return;
+    if (!user && !isDemo) return;
 
     if (isDemo) {
       setMembers([
@@ -245,7 +258,17 @@ function KnobelKasse() {
           }
           setter(data);
         },
-        (err) => console.error(`Ladefehler ${colName}:`, err)
+        (err) => {
+            console.error(`Ladefehler ${colName}:`, err);
+            // STRENGER MODUS: Fehler anzeigen statt Demo
+            if (err.code === 'permission-denied') {
+                setConnectionError("DATENBANK-FEHLER: Zugriff verweigert. Haben Sie 'Firestore Database' erstellt und 'Testmodus' gewählt?");
+            } else if (err.code === 'unavailable') {
+                setConnectionError("Verbindung unterbrochen (Offline).");
+            } else {
+                setConnectionError(`Datenbankfehler: ${err.message}`);
+            }
+        }
       );
     };
 
@@ -357,7 +380,7 @@ function KnobelKasse() {
   // Views
   const totalDebt = members.reduce((acc, m) => acc + (m.debt || 0), 0);
 
-  if (!user) return <div className="flex h-screen items-center justify-center bg-slate-900 text-white"><p className="animate-pulse">Lade Specialized-App...</p></div>;
+  if (!user && !connectionError) return <div className="flex h-screen items-center justify-center bg-slate-900 text-white"><p className="animate-pulse">Lade Specialized-App...</p></div>;
 
   return (
     <div className="flex flex-col h-screen bg-slate-50 font-sans text-slate-800 w-full relative overflow-hidden">
@@ -376,6 +399,20 @@ function KnobelKasse() {
           </button>
         </div>
       </header>
+
+      {/* FEHLERMELDUNG BEI VERBINDUNGSPROBLEMEN */}
+      {connectionError && (
+          <div className="bg-red-600 text-white px-4 py-3 text-center text-sm font-bold flex items-center justify-center gap-2 shadow-lg">
+              <AlertCircle className="w-5 h-5 shrink-0" />
+              <span>{connectionError}</span>
+          </div>
+      )}
+
+      {/* STATUS INDIKATOR UNTEN RECHTS */}
+      <div className={`fixed bottom-20 right-4 z-50 text-[10px] px-2 py-1 rounded-full flex items-center gap-1 font-mono shadow-md ${connectionError ? 'bg-red-100 text-red-700' : (isDemo ? 'bg-amber-100 text-amber-700' : 'bg-green-100 text-green-700')}`}>
+         {connectionError ? <WifiOff className="w-3 h-3"/> : <Wifi className="w-3 h-3"/>}
+         {connectionError ? 'Offline/Fehler' : (isDemo ? 'Lokal (Demo)' : 'Live Verbunden')}
+      </div>
 
       <main className="flex-1 overflow-y-auto bg-slate-50 pb-24 w-full">
         <div className="max-w-2xl mx-auto w-full">
