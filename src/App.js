@@ -56,7 +56,8 @@ import {
   Globe,
   Info,
   ExternalLink,
-  Loader2
+  Loader2,
+  Save
 } from 'lucide-react';
 
 // ==========================================
@@ -228,20 +229,28 @@ function KnobelKasse() {
     });
   }, []);
 
-  // 2. Data Loading
+  // 2. Data Loading (Online & Offline/Demo)
   useEffect(() => {
     if (!user && !isDemo) return;
 
+    // --- OFFLINE / LOKALER SPEICHER LOGIK ---
     if (isDemo) {
-      setMembers([
-        { id: '1', name: 'Demo Max', debt: 15.50 },
-        { id: '2', name: 'Demo Erika', debt: 0 },
-      ]);
-      setCatalog([{ id: 'c1', title: 'Zu spät', amount: 2.00, count: 5 }]);
-      setHistory([]);
+      const loadLocal = (key, def) => {
+          try {
+              const item = localStorage.getItem(`knobel_${key}`);
+              return item ? JSON.parse(item) : def;
+          } catch(e) { return def; }
+      };
+
+      setMembers(loadLocal('members', [{ id: '1', name: 'Beispiel Bernd', debt: 0 }]));
+      setCatalog(loadLocal('catalog', [{ id: 'c1', title: 'Zu spät', amount: 2.00, count: 0 }]));
+      setEvents(loadLocal('events', []));
+      setHistory(loadLocal('history', []));
+      setPot(loadLocal('pot', { balance: 0 }));
       return;
     }
 
+    // --- ONLINE FIREBASE LOGIK ---
     if (!db) return;
 
     // HELPER: Intelligente Pfadwahl
@@ -274,8 +283,10 @@ function KnobelKasse() {
         (err) => {
             console.error(`Ladefehler ${colName}:`, err);
             setConnectionError(`DB Fehler: ${err.message}`);
+            // Fallback auf Local Mode bei Permission Errors
             if (err.code === 'permission-denied') {
                 setAuthErrorType('rules');
+                setIsDemo(true);
             }
         }
       );
@@ -306,9 +317,35 @@ function KnobelKasse() {
       return doc(db, 'artifacts', appId, 'public', 'data', name, id);
   }
 
-  // ACTIONS
+  // --- LOCAL STORAGE HELPER ---
+  const saveLocal = (key, data) => {
+      try { localStorage.setItem(`knobel_${key}`, JSON.stringify(data)); }
+      catch(e) { console.error("Local Save Error", e); }
+  };
+
+  // --- ACTIONS (UNIFIED) ---
+
   const bookPenalty = async (memberId, memberName, penaltyTitle, amount, catalogId) => {
-    if (isDemo) return;
+    // OFFLINE
+    if (isDemo) {
+        const newMembers = members.map(m => m.id === memberId ? { ...m, debt: (m.debt || 0) + amount } : m);
+        const newHistory = [{ id: Date.now().toString(), text: `${memberName}: ${penaltyTitle}`, amount, type: 'penalty', createdAt: { seconds: Date.now()/1000 } }, ...history];
+        
+        let newCatalog = catalog;
+        if (catalogId) {
+            newCatalog = catalog.map(c => c.id === catalogId ? { ...c, count: (c.count || 0) + 1 } : c);
+            setCatalog(newCatalog);
+            saveLocal('catalog', newCatalog);
+        }
+
+        setMembers(newMembers);
+        setHistory(newHistory);
+        saveLocal('members', newMembers);
+        saveLocal('history', newHistory);
+        return;
+    }
+
+    // ONLINE
     try {
       await updateDoc(getDocRef('knobel_members', memberId), { debt: increment(amount) });
       if (catalogId) await updateDoc(getDocRef('knobel_catalog', catalogId), { count: increment(1) });
@@ -317,7 +354,22 @@ function KnobelKasse() {
   };
 
   const payDebt = async (memberId, memberName, amount) => {
-    if (isDemo) return;
+    // OFFLINE
+    if (isDemo) {
+        const newMembers = members.map(m => m.id === memberId ? { ...m, debt: (m.debt || 0) - amount } : m);
+        const newHistory = [{ id: Date.now().toString(), text: `${memberName} hat eingezahlt`, amount: -amount, type: 'payment', createdAt: { seconds: Date.now()/1000 } }, ...history];
+        const newPot = { balance: (pot.balance || 0) + amount };
+
+        setMembers(newMembers);
+        setHistory(newHistory);
+        setPot(newPot);
+        saveLocal('members', newMembers);
+        saveLocal('history', newHistory);
+        saveLocal('pot', newPot);
+        return;
+    }
+
+    // ONLINE
     try {
       await updateDoc(getDocRef('knobel_members', memberId), { debt: increment(-amount) });
       await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(amount) }, { merge: true });
@@ -326,24 +378,92 @@ function KnobelKasse() {
   };
 
   const bookExpense = async (title, amount) => {
-      if (isDemo) return;
+      // OFFLINE
+      if (isDemo) {
+          const newPot = { balance: (pot.balance || 0) - amount };
+          const newHistory = [{ id: Date.now().toString(), text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: { seconds: Date.now()/1000 } }, ...history];
+          setPot(newPot);
+          setHistory(newHistory);
+          saveLocal('pot', newPot);
+          saveLocal('history', newHistory);
+          return;
+      }
+
+      // ONLINE
       try {
         await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(-amount) }, { merge: true });
         await addDoc(getCol('knobel_history'), { text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: serverTimestamp() });
       } catch (e) { console.error(e); }
   }
 
-  // Demo Helpers
-  const addDemoItem = (listName, item) => {
-    const newItem = { ...item, id: Math.random().toString() };
-    if (listName === 'members') setMembers(p => [...p, { ...newItem, debt: 0 }]);
-    if (listName === 'catalog') setCatalog(p => [...p, { ...newItem, count: 0 }]);
-    if (listName === 'events') setEvents(p => [...p, newItem]);
+  // UNIFIED CRUD HANDLERS
+  const handleAddMember = async (name) => {
+      if (isDemo) {
+          const newItem = { id: Date.now().toString(), name, debt: 0 };
+          const newMembers = [...members, newItem];
+          setMembers(newMembers);
+          saveLocal('members', newMembers);
+      } else {
+          const col = isManualMode ? collection(db, 'knobel_members') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_members');
+          await addDoc(col, { name, debt: 0, createdAt: serverTimestamp() });
+      }
   };
-  const deleteDemoItem = (listName, id) => {
-     if (listName === 'members') setMembers(p => p.filter(i => i.id !== id));
-     if (listName === 'catalog') setCatalog(p => p.filter(i => i.id !== id));
-     if (listName === 'events') setEvents(p => p.filter(i => i.id !== id));
+
+  const handleDeleteMember = async (id) => {
+      if (isDemo) {
+          const newMembers = members.filter(m => m.id !== id);
+          setMembers(newMembers);
+          saveLocal('members', newMembers);
+      } else {
+          const docRef = isManualMode ? doc(db, 'knobel_members', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_members', id);
+          await deleteDoc(docRef);
+      }
+  };
+
+  const handleAddCatalog = async (title, amount) => {
+      if (isDemo) {
+          const newItem = { id: Date.now().toString(), title, amount, count: 0 };
+          const newCatalog = [...catalog, newItem];
+          setCatalog(newCatalog);
+          saveLocal('catalog', newCatalog);
+      } else {
+          const col = isManualMode ? collection(db, 'knobel_catalog') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog');
+          await addDoc(col, { title, amount, createdAt: serverTimestamp(), count: 0 });
+      }
+  };
+
+  const handleDeleteCatalog = async (id) => {
+      if (isDemo) {
+          const newCatalog = catalog.filter(c => c.id !== id);
+          setCatalog(newCatalog);
+          saveLocal('catalog', newCatalog);
+      } else {
+          const docRef = isManualMode ? doc(db, 'knobel_catalog', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog', id);
+          await deleteDoc(docRef);
+      }
+  };
+
+  const handleAddEvent = async (date, time, location) => {
+      if (isDemo) {
+          const newItem = { id: Date.now().toString(), date, time, location };
+          const newEvents = [...events, newItem];
+          setEvents(newEvents);
+          saveLocal('events', newEvents);
+      } else {
+          const col = isManualMode ? collection(db, 'knobel_events') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_events');
+          await addDoc(col, { date, time, location, createdAt: serverTimestamp() });
+      }
+  };
+
+  const handleDeleteEvent = async (id) => {
+      if (isDemo) {
+          const newEvents = events.filter(e => e.id !== id);
+          setEvents(newEvents);
+          saveLocal('events', newEvents);
+      } else {
+          const docRef = isManualMode ? doc(db, 'knobel_events', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_events', id);
+          await deleteDoc(docRef);
+      }
   };
 
   const handleAdminLogin = (e) => {
@@ -354,6 +474,17 @@ function KnobelKasse() {
       alert("Falsche PIN!");
     }
   };
+
+  const clearLocalData = () => {
+      if (confirm("Wirklich alle lokalen Daten löschen?")) {
+          localStorage.removeItem('knobel_members');
+          localStorage.removeItem('knobel_catalog');
+          localStorage.removeItem('knobel_events');
+          localStorage.removeItem('knobel_history');
+          localStorage.removeItem('knobel_pot');
+          window.location.reload();
+      }
+  }
 
   // Views
   const totalDebt = members.reduce((acc, m) => acc + (m.debt || 0), 0);
@@ -372,7 +503,7 @@ function KnobelKasse() {
         <div className="max-w-4xl mx-auto flex justify-between items-center px-2">
           <div className="flex items-center gap-2">
             <HeaderGraphic />
-            {isDemo && <span className="bg-amber-600 text-white text-[10px] px-2 py-0.5 rounded-md font-bold uppercase self-start mt-1">Demo</span>}
+            {isDemo && <span className="bg-amber-600 text-white text-[10px] px-2 py-0.5 rounded-md font-bold uppercase self-start mt-1">Offline</span>}
           </div>
           <button 
             onClick={() => isAdmin ? setIsAdmin(false) : setShowAdminLogin(true)} 
@@ -403,14 +534,15 @@ function KnobelKasse() {
                 <span>Keine Schreibrechte</span>
               </div>
               <div className="text-xs font-normal mt-1 opacity-90">
-                  Setze Firestore Rules auf: <code>allow read, write: if true;</code>
+                  Wechsle auf lokalen Speicher...
               </div>
           </div>
       )}
       
       {!authErrorType && isDemo && !connectionError && (
-          <div className="bg-amber-500 text-white px-4 py-2 text-center text-xs font-bold shadow-md">
-              DEMO MODUS (Offline)
+          <div className="bg-amber-500 text-white px-4 py-2 text-center text-xs font-bold shadow-md flex justify-between items-center">
+              <span>OFFLINE / LOKAL</span>
+              {isAdmin && <button onClick={clearLocalData} className="underline opacity-80 hover:opacity-100">Reset?</button>}
           </div>
       )}
 
@@ -419,16 +551,16 @@ function KnobelKasse() {
         <div className="max-w-2xl mx-auto w-full">
           {activeTab === 'dashboard' && <DashboardView members={members} history={history} totalDebt={totalDebt} pot={pot} onExpense={bookExpense} catalog={catalog} isAdmin={isAdmin} />}
           {activeTab === 'kasse' && <CashierView members={members} catalog={catalog} onBook={bookPenalty} onPay={payDebt} />}
-          {activeTab === 'members' && <MembersView members={members} onPay={payDebt} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('members', i)} onDemoDelete={(id)=>deleteDemoItem('members', id)} isManualMode={isManualMode} isAdmin={isAdmin} />}
-          {activeTab === 'settings' && <CatalogView catalog={catalog} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('catalog', i)} onDemoDelete={(id)=>deleteDemoItem('catalog', id)} isManualMode={isManualMode} isAdmin={isAdmin} />}
-          {activeTab === 'calendar' && <CalendarView events={events} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('events', i)} onDemoDelete={(id)=>deleteDemoItem('events', id)} isManualMode={isManualMode} isAdmin={isAdmin} />}
+          {activeTab === 'members' && <MembersView members={members} onPay={payDebt} onAdd={handleAddMember} onDelete={handleDeleteMember} isAdmin={isAdmin} />}
+          {activeTab === 'settings' && <CatalogView catalog={catalog} onAdd={handleAddCatalog} onDelete={handleDeleteCatalog} isAdmin={isAdmin} />}
+          {activeTab === 'calendar' && <CalendarView events={events} onAdd={handleAddEvent} onDelete={handleDeleteEvent} isAdmin={isAdmin} />}
         </div>
       </main>
 
       {/* FOOTER DEBUG */}
       <div className="bg-slate-100 p-2 text-[10px] text-slate-400 text-center border-t border-slate-200">
           DB: {isManualMode ? 'Manuell' : 'Auto'} • 
-          Status: {isDemo ? 'Lokal' : 'Online'} •
+          Status: {isDemo ? 'Lokal (Gespeichert)' : 'Online (Firebase)'} •
           {authErrorType ? ' FEHLER!' : ' Bereit'}
       </div>
 
@@ -493,7 +625,8 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
     const today = new Date().setHours(0,0,0,0);
     const todayPenalties = history.filter(h => {
         if (h.type !== 'penalty' || !h.createdAt) return false;
-        const d = new Date(h.createdAt.seconds * 1000);
+        const seconds = h.createdAt.seconds || (h.createdAt.getTime ? h.createdAt.getTime()/1000 : 0);
+        const d = new Date(seconds * 1000);
         return d.setHours(0,0,0,0) === today;
     });
 
@@ -518,7 +651,8 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
   const getAllTimeHighscores = () => {
       const eveningSums = {}; 
       history.filter(h => h.type === 'penalty' && h.createdAt).forEach(h => {
-          const date = new Date(h.createdAt.seconds * 1000);
+          const seconds = h.createdAt.seconds || (h.createdAt.getTime ? h.createdAt.getTime()/1000 : 0);
+          const date = new Date(seconds * 1000);
           const dateStr = date.toLocaleDateString('de-DE'); 
           const name = h.text.split(':')[0].trim();
           const key = `${dateStr}_${name}`;
@@ -607,7 +741,9 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
           {history.length > 0 ? history.map((item, i) => {
             const isPayment = item.type === 'payment';
             const isExpense = item.type === 'expense';
-            const date = item.createdAt ? new Date(item.createdAt.seconds * 1000) : new Date();
+            const seconds = item.createdAt.seconds || (item.createdAt.getTime ? item.createdAt.getTime()/1000 : 0);
+            const date = new Date(seconds * 1000);
+            
             let iconColor = 'text-red-600 bg-red-100';
             let Icon = ArrowUpRight;
             if (isPayment) { iconColor = 'text-green-600 bg-green-100'; Icon = ArrowDownLeft; }
@@ -807,7 +943,7 @@ function CashierView({ members, catalog, onBook, onPay }) {
   );
 }
 
-function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelete, isManualMode, isAdmin }) {
+function MembersView({ members, onPay, onAdd, onDelete, isAdmin }) {
   const [payModal, setPayModal] = useState(null);
   const [payAmount, setPayAmount] = useState('');
   const [newMemberName, setNewMemberName] = useState('');
@@ -817,22 +953,12 @@ function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelet
   const addMember = async (e) => {
     e.preventDefault();
     if(!newMemberName.trim()) return;
-    if (isDemo) onDemoAdd({ name: newMemberName });
-    else {
-        // Safe check
-        const col = isManualMode ? collection(db, 'knobel_members') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_members');
-        await addDoc(col, { name: newMemberName, debt: 0, createdAt: serverTimestamp() });
-    }
+    await onAdd(newMemberName);
     setNewMemberName(''); setShowAdd(false);
   };
 
   const deleteMember = async (id) => {
-    if (isDemo) onDemoDelete(id);
-    else {
-        // Safe check
-        const docRef = isManualMode ? doc(db, 'knobel_members', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_members', id);
-        await deleteDoc(docRef);
-    }
+    await onDelete(id);
     setDeleteId(null);
   };
 
@@ -924,7 +1050,7 @@ function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelet
   );
 }
 
-function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, isManualMode, isAdmin }) {
+function CatalogView({ catalog, onAdd, onDelete, isAdmin }) {
     const [title, setTitle] = useState('');
     const [amount, setAmount] = useState('');
     const [delId, setDelId] = useState(null);
@@ -932,20 +1058,12 @@ function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, isMa
     const add = async (e) => {
         e.preventDefault();
         if(!title || !amount) return;
-        if (isDemo) onDemoAdd({ title, amount: parseFloat(amount) });
-        else {
-            const col = isManualMode ? collection(db, 'knobel_catalog') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog');
-            await addDoc(col, { title, amount: parseFloat(amount), createdAt: serverTimestamp(), count: 0 });
-        }
+        await onAdd(title, parseFloat(amount));
         setTitle(''); setAmount('');
     };
 
     const del = async (id) => { 
-      if (isDemo) onDemoDelete(id);
-      else {
-          const docRef = isManualMode ? doc(db, 'knobel_catalog', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog', id);
-          await deleteDoc(docRef); 
-      }
+      await onDelete(id);
       setDelId(null); 
     };
 
@@ -986,7 +1104,7 @@ function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, isMa
     );
 }
 
-function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, isManualMode, isAdmin }) {
+function CalendarView({ events, onAdd, onDelete, isAdmin }) {
     const [date, setDate] = useState('');
     const [time, setTime] = useState('');
     const [loc, setLoc] = useState('');
@@ -994,20 +1112,12 @@ function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, isMa
 
     const add = async (e) => {
         e.preventDefault(); if(!date) return;
-        if (isDemo) onDemoAdd({ date, time, location: loc });
-        else {
-            const col = isManualMode ? collection(db, 'knobel_events') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_events');
-            await addDoc(col, { date, time, location: loc, createdAt: serverTimestamp() });
-        }
+        await onAdd(date, time, loc);
         setDate(''); setTime(''); setLoc('');
     };
 
     const del = async (id) => { 
-      if (isDemo) onDemoDelete(id);
-      else {
-          const docRef = isManualMode ? doc(db, 'knobel_events', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_events', id);
-          await deleteDoc(docRef); 
-      }
+      await onDelete(id);
       setDelId(null); 
     };
 
