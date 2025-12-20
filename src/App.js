@@ -210,7 +210,6 @@ function KnobelKasse() {
       ]);
       setEvents([{ id: 'e1', date: '2024-12-24', time: '18:00', location: 'Vereinsheim' }]);
       setPot({ balance: 45.50 });
-      // Demo History erweitern für Tests
       setHistory([
         { id: 'h1', text: 'Max Mustermann: Zu spät', amount: 2.00, type: 'penalty', createdAt: { seconds: Date.now() / 1000 } },
         { id: 'h2', text: 'Max Mustermann hat eingezahlt', amount: -5.00, type: 'payment', createdAt: { seconds: (Date.now() - 10000) / 1000 } }
@@ -236,8 +235,6 @@ function KnobelKasse() {
           if (colName === 'knobel_events') data.sort((a, b) => new Date(a.date) - new Date(b.date));
           if (colName === 'knobel_history') {
              data.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
-             // WICHTIG: Limit entfernt, damit wir die ewige Bestenliste berechnen können
-             // Bei sehr vielen Daten (>2000) müsste man das optimieren.
              setter(data);
              return;
           }
@@ -255,7 +252,7 @@ function KnobelKasse() {
     const unsubMembers = safeSnapshot('knobel_members', setMembers);
     const unsubCatalog = safeSnapshot('knobel_catalog', setCatalog);
     const unsubEvents = safeSnapshot('knobel_events', setEvents);
-    const unsubHistory = safeSnapshot('knobel_history', setHistory); // Kein Limit mehr
+    const unsubHistory = safeSnapshot('knobel_history', setHistory);
     const unsubPot = safeSnapshot('knobel_pot', setPot);
 
     return () => {
@@ -296,7 +293,6 @@ function KnobelKasse() {
         const catRef = getDocRef('knobel_catalog', catalogId);
         if(catRef) await updateDoc(catRef, { count: increment(1) });
     }
-    // Wichtig: Wir speichern das Format "Name: Grund" - darauf basiert die Statistik-Auswertung
     await addDoc(histCol, { text: `${memberName}: ${penaltyTitle}`, amount, type: 'penalty', createdAt: serverTimestamp() });
   };
 
