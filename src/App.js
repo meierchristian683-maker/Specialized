@@ -29,9 +29,7 @@ import {
   Trash2, 
   Share2, 
   Euro, 
-  Menu,
   Home,
-  Check, 
   X,
   AlertCircle,
   Bell,
@@ -47,22 +45,18 @@ import {
   ShieldCheck,
   Banknote,
   PenTool,
-  Dices,
   Crown,
   Flame,
   Wifi,
   WifiOff,
-  Database,
-  Globe,
   Info,
-  ExternalLink,
   Loader2,
-  Save,
-  RefreshCw
+  Copy,
+  CheckCircle2
 } from 'lucide-react';
 
 // ==========================================
-// 1. KONFIGURATION (Robust)
+// 1. KONFIGURATION
 // ==========================================
 
 const manualConfig = {
@@ -78,8 +72,6 @@ let app, auth, db, configError;
 
 try {
   let firebaseConfig = manualConfig;
-  
-  // Versuche Umgebungskonfiguration, falle aber sicher zurück
   if (typeof __firebase_config !== 'undefined' && __firebase_config) {
     try {
       firebaseConfig = JSON.parse(__firebase_config);
@@ -87,23 +79,21 @@ try {
       console.warn("Auto-Config fehlgeschlagen, nutze Fallback.");
     }
   }
-
   app = initializeApp(firebaseConfig);
   auth = getAuth(app);
   db = getFirestore(app);
-  
 } catch (e) {
   console.error("Firebase Init Error:", e);
   configError = e.message;
 }
 
-// WICHTIG: Einheitliche App ID Logik
-// Wenn keine App-ID vom System kommt, nutzen wir eine feste "Default-Lobby",
-// damit alle "Fallback"-Nutzer zumindest im selben Raum landen.
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'knobelkasse-default-lobby';
+// Ermittle App ID sicher und erstelle einen kurzen "Club Code" für die Anzeige
+const rawAppId = typeof __app_id !== 'undefined' ? __app_id : 'knobelkasse-default-lobby';
+// Nimm die letzten 4 Zeichen der ID als "Sichtbaren Code" zur Kontrolle
+const roomCode = rawAppId.slice(-4).toUpperCase();
 
 // ==========================================
-// 2. HEADER GRAFIK
+// HEADER GRAFIK
 // ==========================================
 
 function HeaderGraphic() {
@@ -141,14 +131,13 @@ class ErrorBoundary extends React.Component {
     this.state = { hasError: false, error: null };
   }
   static getDerivedStateFromError(error) { return { hasError: true, error }; }
-  componentDidCatch(error, errorInfo) { console.error("App Crash:", error, errorInfo); }
   render() {
     if (this.state.hasError) {
       return (
         <div className="p-6 bg-red-50 text-red-900 h-screen flex flex-col items-center justify-center text-center font-sans">
           <AlertCircle className="w-12 h-12 mb-4 text-red-600" />
-          <h1 className="text-xl font-bold mb-2">Ein Fehler ist aufgetreten</h1>
-          <p className="mb-4 text-sm bg-red-100 p-2 rounded font-mono">{this.state.error?.message || "Unbekannter Fehler"}</p>
+          <h1 className="text-xl font-bold mb-2">Absturz!</h1>
+          <p className="mb-4 text-sm bg-red-100 p-2 rounded font-mono">{this.state.error?.message}</p>
           <button onClick={() => window.location.reload()} className="bg-red-600 text-white px-6 py-3 rounded-lg font-bold">Neu laden</button>
         </div>
       );
@@ -158,61 +147,59 @@ class ErrorBoundary extends React.Component {
 }
 
 // ==========================================
-// MAIN APP COMPONENT
+// MAIN APP
 // ==========================================
 
 function KnobelKasse() {
-  if (configError) throw new Error("Initialisierungsfehler: " + configError);
+  if (configError) throw new Error("Init Fehler: " + configError);
 
   const [user, setUser] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isDemo, setIsDemo] = useState(false);
   const [connectionError, setConnectionError] = useState(null); 
-  
-  // Admin State
+  const [writeError, setWriteError] = useState(null); // Neuer State für Schreibfehler
+  const [showDebug, setShowDebug] = useState(false); // Debug Modal
+
+  // Admin
   const [isAdmin, setIsAdmin] = useState(false);
   const [showAdminLogin, setShowAdminLogin] = useState(false);
   const ADMIN_PIN = "1234";
 
-  // Data States
+  // Data
   const [members, setMembers] = useState([]);
   const [catalog, setCatalog] = useState([]);
   const [events, setEvents] = useState([]);
   const [history, setHistory] = useState([]);
   const [pot, setPot] = useState({ balance: 0 });
 
-  // 1. AUTHENTIFIZIERUNG
+  // 1. AUTH
   useEffect(() => {
     const initAuth = async () => {
       try {
         await setPersistence(auth, browserLocalPersistence);
-        
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
             await signInWithCustomToken(auth, __initial_auth_token);
         } else {
             await signInAnonymously(auth);
         }
       } catch (err) {
-        console.error("Auth Fehler:", err);
+        console.error("Auth Fail:", err);
         setConnectionError(err.message);
-        // Wir gehen erst in den Demo-Modus, wenn Auth komplett fehlschlägt
         setIsDemo(true); 
       }
     };
     initAuth();
-    
     return onAuthStateChanged(auth, (u) => {
         if (u) {
             setUser(u);
             setConnectionError(null);
-            setIsDemo(false); // Versuche Online zu gehen
+            setIsDemo(false);
         }
     });
   }, []);
 
-  // 2. Data Loading
+  // 2. DATA SYNC
   useEffect(() => {
-    // Wenn kein User, warte. Wenn Offline-Modus erzwungen (Demo), lade Lokal.
     if ((!user && !isDemo) || !db) return;
 
     if (isDemo) {
@@ -220,241 +207,213 @@ function KnobelKasse() {
         return;
     }
 
-    // --- ONLINE LOGIK (IMMER ARTIFACTS PFAD) ---
-    // Wir nutzen jetzt IMMER den langen Pfad, egal welche Config.
-    // Das stellt sicher, dass wir nicht in gesperrte Root-Verzeichnisse schreiben.
-    
-    const getPath = (col) => collection(db, 'artifacts', appId, 'public', 'data', col);
+    // ONLINE PFAD - Nutzen strikt artifacts/{rawAppId}/public/data
+    const getPath = (col) => collection(db, 'artifacts', rawAppId, 'public', 'data', col);
 
     const safeSnapshot = (colName, setter) => {
       return onSnapshot(getPath(colName), (snap) => {
           const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-          
           if (colName === 'knobel_members') data.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
           if (colName === 'knobel_history') {
              data.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
-             setter(data);
-             return;
+             setter(data); return;
           }
           if (colName === 'knobel_pot') {
-              if (data.length > 0) setter(data[0]);
-              else setter({ balance: 0 });
-              return;
+              setter(data.length > 0 ? data[0] : { balance: 0 }); return;
           }
           setter(data);
         },
         (err) => {
-            console.error(`Ladefehler ${colName}:`, err);
-            // Nur wenn wirklich Permission denied auf dem korrekten Pfad kommt, gehen wir offline
+            console.error(`Read Error ${colName}:`, err);
             if (err.code === 'permission-denied') {
-                console.warn("Kein Zugriff auf DB -> Wechsel zu Offline Modus");
+                setConnectionError("Keine Leserechte (Server blockiert)");
                 setIsDemo(true);
-                setConnectionError("Keine Schreibrechte (Offline)");
             }
         }
       );
     };
 
-    const unsubMembers = safeSnapshot('knobel_members', setMembers);
-    const unsubCatalog = safeSnapshot('knobel_catalog', setCatalog);
-    const unsubEvents = safeSnapshot('knobel_events', setEvents);
-    const unsubHistory = safeSnapshot('knobel_history', setHistory);
-    const unsubPot = safeSnapshot('knobel_pot', setPot);
+    const unsubs = [
+        safeSnapshot('knobel_members', setMembers),
+        safeSnapshot('knobel_catalog', setCatalog),
+        safeSnapshot('knobel_events', setEvents),
+        safeSnapshot('knobel_history', setHistory),
+        safeSnapshot('knobel_pot', setPot)
+    ];
 
-    return () => {
-      unsubMembers && unsubMembers();
-      unsubCatalog && unsubCatalog();
-      unsubEvents && unsubEvents();
-      unsubHistory && unsubHistory();
-      unsubPot && unsubPot();
-    };
+    return () => unsubs.forEach(u => u && u());
   }, [user, isDemo]);
 
-  // LOCAL STORAGE LOADER
+  // LOCAL LOAD
   const loadLocalData = () => {
-      const load = (key, def) => {
-          try { return JSON.parse(localStorage.getItem(`knobel_${key}`)) || def; } 
-          catch(e) { return def; }
-      };
+      const load = (k, d) => { try { return JSON.parse(localStorage.getItem(`knobel_${k}`)) || d; } catch(e){ return d; } };
       setMembers(load('members', []));
-      setCatalog(load('catalog', [{id:'demo', title:'Offline-Beispiel', amount: 5}]));
+      setCatalog(load('catalog', [{id:'demo', title:'Offline-Bsp', amount: 5}]));
       setEvents(load('events', []));
       setHistory(load('history', []));
       setPot(load('pot', { balance: 0 }));
   };
 
-  // --- ACTIONS (UNIFIED) ---
-  // Helper für korrekte Pfade (immer Artifacts!)
-  const getCol = (name) => collection(db, 'artifacts', appId, 'public', 'data', name);
-  const getDocRef = (name, id) => doc(db, 'artifacts', appId, 'public', 'data', name, id);
-  const saveLocal = (key, data) => localStorage.setItem(`knobel_${key}`, JSON.stringify(data));
+  // 3. ACTIONS & ERROR HANDLING
+  const getCol = (name) => collection(db, 'artifacts', rawAppId, 'public', 'data', name);
+  const getDocRef = (name, id) => doc(db, 'artifacts', rawAppId, 'public', 'data', name, id);
+  const saveLocal = (k, d) => localStorage.setItem(`knobel_${k}`, JSON.stringify(d));
 
-  const bookPenalty = async (memberId, memberName, penaltyTitle, amount, catalogId) => {
-    if (isDemo) {
-        const newMembers = members.map(m => m.id === memberId ? { ...m, debt: (m.debt || 0) + amount } : m);
-        const newHistory = [{ id: Date.now().toString(), text: `${memberName}: ${penaltyTitle}`, amount, type: 'penalty', createdAt: { seconds: Date.now()/1000 } }, ...history];
-        setMembers(newMembers); setHistory(newHistory);
-        saveLocal('members', newMembers); saveLocal('history', newHistory);
-        return;
-    }
-    try {
-      await updateDoc(getDocRef('knobel_members', memberId), { debt: increment(amount) });
-      if (catalogId) await updateDoc(getDocRef('knobel_catalog', catalogId), { count: increment(1) });
-      await addDoc(getCol('knobel_history'), { text: `${memberName}: ${penaltyTitle}`, amount, type: 'penalty', createdAt: serverTimestamp() });
-    } catch (e) { console.error(e); }
-  };
-
-  const payDebt = async (memberId, memberName, amount) => {
-    if (isDemo) {
-        const newMembers = members.map(m => m.id === memberId ? { ...m, debt: (m.debt || 0) - amount } : m);
-        const newHistory = [{ id: Date.now().toString(), text: `${memberName} hat eingezahlt`, amount: -amount, type: 'payment', createdAt: { seconds: Date.now()/1000 } }, ...history];
-        const newPot = { balance: (pot.balance || 0) + amount };
-        setMembers(newMembers); setHistory(newHistory); setPot(newPot);
-        saveLocal('members', newMembers); saveLocal('history', newHistory); saveLocal('pot', newPot);
-        return;
-    }
-    try {
-      await updateDoc(getDocRef('knobel_members', memberId), { debt: increment(-amount) });
-      await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(amount) }, { merge: true });
-      await addDoc(getCol('knobel_history'), { text: `${memberName} hat eingezahlt`, amount: -amount, type: 'payment', createdAt: serverTimestamp() });
-    } catch (e) { console.error(e); }
-  };
-
-  const bookExpense = async (title, amount) => {
+  // Wrapper für alle Schreibzugriffe mit Fehleranzeige
+  const safeWrite = async (operationName, operationFn) => {
+      setWriteError(null);
       if (isDemo) {
-          const newPot = { balance: (pot.balance || 0) - amount };
-          const newHistory = [{ id: Date.now().toString(), text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: { seconds: Date.now()/1000 } }, ...history];
-          setPot(newPot); setHistory(newHistory);
-          saveLocal('pot', newPot); saveLocal('history', newHistory);
+          try { await operationFn(); } catch(e) { console.error("Local Error", e); }
           return;
       }
       try {
-        await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(-amount) }, { merge: true });
-        await addDoc(getCol('knobel_history'), { text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: serverTimestamp() });
-      } catch (e) { console.error(e); }
-  }
-
-  const handleAddMember = async (name) => {
-      if (isDemo) {
-          const newItem = { id: Date.now().toString(), name, debt: 0 };
-          const newMembers = [...members, newItem];
-          setMembers(newMembers); saveLocal('members', newMembers);
-      } else {
-          await addDoc(getCol('knobel_members'), { name, debt: 0, createdAt: serverTimestamp() });
+          await operationFn();
+      } catch (e) {
+          console.error(`Write Error (${operationName}):`, e);
+          setWriteError(`Fehler beim Speichern (${operationName}): ${e.message}`);
+          // Optional: Nach 5 Sekunden Fehler ausblenden
+          setTimeout(() => setWriteError(null), 8000);
       }
   };
 
-  const handleDeleteMember = async (id) => {
-      if (isDemo) {
-          const newMembers = members.filter(m => m.id !== id);
-          setMembers(newMembers); saveLocal('members', newMembers);
-      } else {
-          await deleteDoc(getDocRef('knobel_members', id));
-      }
-  };
+  const bookPenalty = (mId, mName, title, amount, cId) => safeWrite('Strafe buchen', async () => {
+    if (isDemo) {
+        const nM = members.map(m => m.id === mId ? { ...m, debt: (m.debt||0)+amount } : m);
+        const nH = [{ id: Date.now().toString(), text: `${mName}: ${title}`, amount, type: 'penalty', createdAt: {seconds: Date.now()/1000} }, ...history];
+        setMembers(nM); setHistory(nH); saveLocal('members', nM); saveLocal('history', nH);
+        return;
+    }
+    await updateDoc(getDocRef('knobel_members', mId), { debt: increment(amount) });
+    if (cId) await updateDoc(getDocRef('knobel_catalog', cId), { count: increment(1) });
+    await addDoc(getCol('knobel_history'), { text: `${mName}: ${title}`, amount, type: 'penalty', createdAt: serverTimestamp() });
+  });
 
-  const handleAddCatalog = async (title, amount) => {
-      if (isDemo) {
-          const newItem = { id: Date.now().toString(), title, amount, count: 0 };
-          const newCatalog = [...catalog, newItem];
-          setCatalog(newCatalog); saveLocal('catalog', newCatalog);
-      } else {
-          await addDoc(getCol('knobel_catalog'), { title, amount, createdAt: serverTimestamp(), count: 0 });
-      }
-  };
+  const payDebt = (mId, mName, amount) => safeWrite('Einzahlung', async () => {
+    if (isDemo) {
+        const nM = members.map(m => m.id === mId ? { ...m, debt: (m.debt||0)-amount } : m);
+        const nH = [{ id: Date.now().toString(), text: `${mName} Einzahlung`, amount: -amount, type: 'payment', createdAt: {seconds: Date.now()/1000} }, ...history];
+        const nP = { balance: (pot.balance||0)+amount };
+        setMembers(nM); setHistory(nH); setPot(nP); saveLocal('members', nM); saveLocal('history', nH); saveLocal('pot', nP);
+        return;
+    }
+    await updateDoc(getDocRef('knobel_members', mId), { debt: increment(-amount) });
+    await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(amount) }, { merge: true });
+    await addDoc(getCol('knobel_history'), { text: `${mName} Einzahlung`, amount: -amount, type: 'payment', createdAt: serverTimestamp() });
+  });
 
-  const handleDeleteCatalog = async (id) => {
-      if (isDemo) {
-          const newCatalog = catalog.filter(c => c.id !== id);
-          setCatalog(newCatalog); saveLocal('catalog', newCatalog);
-      } else {
-          await deleteDoc(getDocRef('knobel_catalog', id));
+  const bookExpense = (title, amount) => safeWrite('Ausgabe', async () => {
+      if(isDemo) {
+          const nP = { balance: (pot.balance||0)-amount };
+          const nH = [{ id: Date.now().toString(), text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: {seconds: Date.now()/1000} }, ...history];
+          setPot(nP); setHistory(nH); saveLocal('pot', nP); saveLocal('history', nH);
+          return;
       }
-  };
+      await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(-amount) }, { merge: true });
+      await addDoc(getCol('knobel_history'), { text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: serverTimestamp() });
+  });
 
-  const handleAddEvent = async (date, time, location) => {
-      if (isDemo) {
-          const newItem = { id: Date.now().toString(), date, time, location };
-          const newEvents = [...events, newItem];
-          setEvents(newEvents); saveLocal('events', newEvents);
-      } else {
-          await addDoc(getCol('knobel_events'), { date, time, location, createdAt: serverTimestamp() });
+  const handleAddMember = (name) => safeWrite('Mitglied +', async () => {
+      if(isDemo) {
+          const nM = [...members, { id: Date.now().toString(), name, debt: 0 }];
+          setMembers(nM); saveLocal('members', nM);
+          return;
       }
-  };
+      await addDoc(getCol('knobel_members'), { name, debt: 0, createdAt: serverTimestamp() });
+  });
 
-  const handleDeleteEvent = async (id) => {
-      if (isDemo) {
-          const newEvents = events.filter(e => e.id !== id);
-          setEvents(newEvents); saveLocal('events', newEvents);
-      } else {
-          await deleteDoc(getDocRef('knobel_events', id));
-      }
-  };
+  const handleDeleteMember = (id) => safeWrite('Mitglied -', async () => {
+      if(isDemo) { const nM = members.filter(m=>m.id!==id); setMembers(nM); saveLocal('members', nM); return; }
+      await deleteDoc(getDocRef('knobel_members', id));
+  });
 
+  const handleAddCatalog = (title, amount) => safeWrite('Strafe +', async () => {
+      if(isDemo) { const nC = [...catalog, {id: Date.now().toString(), title, amount, count:0}]; setCatalog(nC); saveLocal('catalog', nC); return; }
+      await addDoc(getCol('knobel_catalog'), { title, amount, createdAt: serverTimestamp(), count: 0 });
+  });
+
+  const handleDeleteCatalog = (id) => safeWrite('Strafe -', async () => {
+      if(isDemo) { const nC = catalog.filter(c=>c.id!==id); setCatalog(nC); saveLocal('catalog', nC); return; }
+      await deleteDoc(getDocRef('knobel_catalog', id));
+  });
+
+  const handleAddEvent = (date, time, location) => safeWrite('Termin +', async () => {
+      if(isDemo) { const nE = [...events, {id: Date.now().toString(), date, time, location}]; setEvents(nE); saveLocal('events', nE); return; }
+      await addDoc(getCol('knobel_events'), { date, time, location, createdAt: serverTimestamp() });
+  });
+
+  const handleDeleteEvent = (id) => safeWrite('Termin -', async () => {
+      if(isDemo) { const nE = events.filter(e=>e.id!==id); setEvents(nE); saveLocal('events', nE); return; }
+      await deleteDoc(getDocRef('knobel_events', id));
+  });
+
+  // UI HELPER
   const handleAdminLogin = (e) => {
     e.preventDefault();
-    if (e.target.pin.value === ADMIN_PIN) {
-      setIsAdmin(true); setShowAdminLogin(false);
-    } else {
-      alert("Falsche PIN!");
-    }
+    if (e.target.pin.value === ADMIN_PIN) { setIsAdmin(true); setShowAdminLogin(false); } 
+    else alert("Falsche PIN!");
   };
-
-  const clearLocalData = () => {
-      if (confirm("Lokal gespeicherte Daten löschen?")) {
-          localStorage.removeItem('knobel_members');
-          localStorage.removeItem('knobel_catalog');
-          localStorage.removeItem('knobel_events');
-          localStorage.removeItem('knobel_history');
-          localStorage.removeItem('knobel_pot');
-          window.location.reload();
-      }
-  }
-
-  // Views
-  const totalDebt = members.reduce((acc, m) => acc + (m.debt || 0), 0);
 
   if (!user && !isDemo) return (
     <div className="flex flex-col h-screen items-center justify-center bg-slate-900 text-white p-6 text-center">
         <Loader2 className="w-12 h-12 animate-spin text-amber-500 mb-4" />
-        <p className="animate-pulse mb-2 text-lg font-bold">Verbinde mit Server...</p>
+        <p className="animate-pulse mb-2 text-lg font-bold">Verbinde...</p>
+        <p className="text-xs text-slate-500">Raum: {roomCode}</p>
     </div>
   );
 
+  const totalDebt = members.reduce((acc, m) => acc + (m.debt || 0), 0);
+
   return (
     <div className="flex flex-col h-screen bg-slate-50 font-sans text-slate-800 w-full relative overflow-hidden">
+      
+      {/* HEADER */}
       <header className="bg-slate-900 text-white p-4 pt-8 shadow-md z-10 w-full">
         <div className="max-w-4xl mx-auto flex justify-between items-center px-2">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3">
             <HeaderGraphic />
-            {isDemo ? (
-                 <span className="bg-red-600 text-white text-[10px] px-2 py-0.5 rounded-md font-bold uppercase self-start mt-1 flex items-center gap-1">
-                    <WifiOff className="w-3 h-3" /> Offline
-                 </span>
-            ) : (
-                 <span className="bg-green-600 text-white text-[10px] px-2 py-0.5 rounded-md font-bold uppercase self-start mt-1 flex items-center gap-1 animate-pulse">
-                    <Wifi className="w-3 h-3" /> Live
-                 </span>
-            )}
+            <button 
+                onClick={() => setShowDebug(true)}
+                className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider border transition-all ${isDemo ? 'bg-red-500/20 border-red-500 text-red-200 hover:bg-red-500/40' : 'bg-green-500/20 border-green-500 text-green-200 hover:bg-green-500/40'}`}
+            >
+                {isDemo ? <WifiOff className="w-3 h-3" /> : <Wifi className="w-3 h-3 animate-pulse" />}
+                {isDemo ? 'Offline' : 'Live'}
+            </button>
           </div>
-          <button 
-            onClick={() => isAdmin ? setIsAdmin(false) : setShowAdminLogin(true)} 
-            className={`p-2 rounded-full transition-colors ${isAdmin ? 'bg-amber-500 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'}`}
-          >
-            {isAdmin ? <Unlock className="w-5 h-5" /> : <Lock className="w-5 h-5" />}
-          </button>
+          
+          <div className="flex items-center gap-2">
+             {/* VISUAL ROOM CODE - ESSENTIEL FÜR SYNC CHECK */}
+             <div className="flex flex-col items-end mr-2">
+                 <span className="text-[9px] text-slate-400 uppercase tracking-widest">Club Code</span>
+                 <span className="text-sm font-mono font-bold text-amber-400 select-all">#{roomCode}</span>
+             </div>
+
+             <button 
+                onClick={() => isAdmin ? setIsAdmin(false) : setShowAdminLogin(true)} 
+                className={`p-2 rounded-full transition-colors ${isAdmin ? 'bg-amber-500 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'}`}
+             >
+                {isAdmin ? <Unlock className="w-5 h-5" /> : <Lock className="w-5 h-5" />}
+             </button>
+          </div>
         </div>
       </header>
 
-      {/* OFFLINE WARNING */}
-      {isDemo && (
-          <div className="bg-red-500 text-white px-4 py-2 text-center text-xs font-bold shadow-md flex justify-between items-center z-50">
-              <span className="flex items-center gap-1"><Info className="w-4 h-4"/> Daten werden nur AUF DIESEM GERÄT gespeichert.</span>
-              {isAdmin && <button onClick={clearLocalData} className="underline opacity-80 hover:opacity-100 ml-2">Reset</button>}
+      {/* ERROR TOAST - SEHR WICHTIG FÜR FEEDBACK */}
+      {writeError && (
+          <div className="bg-red-600 text-white p-4 text-center font-bold text-sm shadow-xl z-50 animate-in slide-in-from-top fixed top-20 left-4 right-4 rounded-xl flex items-center gap-3 border-2 border-white/20">
+              <AlertCircle className="w-6 h-6 shrink-0" />
+              <div className="flex-1 text-left">{writeError}</div>
+              <button onClick={() => setWriteError(null)}><X className="w-5 h-5"/></button>
           </div>
       )}
 
-      {/* CONTENT */}
+      {/* OFFLINE BANNER */}
+      {isDemo && (
+          <div className="bg-red-500 text-white px-4 py-2 text-center text-xs font-bold shadow-md flex justify-between items-center z-40 relative">
+              <span className="flex items-center gap-1"><Info className="w-4 h-4"/> Offline-Modus (Lokal)</span>
+          </div>
+      )}
+
+      {/* MAIN CONTENT */}
       <main className="flex-1 overflow-y-auto bg-slate-50 pb-24 w-full">
         <div className="max-w-2xl mx-auto w-full">
           {activeTab === 'dashboard' && <DashboardView members={members} history={history} totalDebt={totalDebt} pot={pot} onExpense={bookExpense} catalog={catalog} isAdmin={isAdmin} />}
@@ -465,13 +424,8 @@ function KnobelKasse() {
         </div>
       </main>
 
-      {/* FOOTER DEBUG - VITAL FOR SYNC CHECKING */}
-      <div className="bg-slate-100 p-2 text-[10px] text-slate-400 text-center border-t border-slate-200 flex flex-col gap-0.5">
-          <div className="font-mono">Room-ID: {appId.slice(0, 15)}...</div>
-          <div>Status: {isDemo ? 'Lokal (Kein Sync)' : 'Verbunden (Sync Aktiv)'}</div>
-      </div>
-
-      <nav className="bg-white border-t border-slate-200 absolute bottom-0 w-full z-20 pb-6 pt-2">
+      {/* NAVIGATION */}
+      <nav className="bg-white border-t border-slate-200 absolute bottom-0 w-full z-20 pb-6 pt-2 shadow-[0_-5px_20px_rgba(0,0,0,0.05)]">
         <div className="max-w-md mx-auto flex justify-between items-center px-4">
           <NavBtn id="dashboard" active={activeTab} set={setActiveTab} icon={Home} label="Start" />
           <NavBtn id="kasse" active={activeTab} set={setActiveTab} icon={Euro} label="Buchen" />
@@ -481,8 +435,9 @@ function KnobelKasse() {
         </div>
       </nav>
 
+      {/* ADMIN MODAL */}
       {showAdminLogin && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in">
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in">
           <div className="bg-white rounded-2xl w-full max-w-xs p-6 shadow-2xl">
             <h3 className="font-bold mb-4 flex items-center gap-2 text-slate-800"><ShieldCheck className="w-5 h-5 text-amber-500"/> Admin Login</h3>
             <form onSubmit={handleAdminLogin}>
@@ -495,11 +450,56 @@ function KnobelKasse() {
           </div>
         </div>
       )}
+
+      {/* DEBUG / CONNECTION MODAL */}
+      {showDebug && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in">
+            <div className="bg-white rounded-2xl w-full max-w-sm p-6 shadow-2xl relative overflow-hidden">
+                <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-amber-400 to-amber-600"></div>
+                <button onClick={() => setShowDebug(false)} className="absolute top-2 right-2 p-2 text-slate-400 hover:text-slate-600"><X className="w-5 h-5"/></button>
+                
+                <h3 className="font-bold text-lg mb-4 flex items-center gap-2">
+                    {isDemo ? <WifiOff className="text-red-500"/> : <Wifi className="text-green-500"/>}
+                    Verbindungsstatus
+                </h3>
+                
+                <div className="space-y-4 text-sm">
+                    <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                        <div className="text-[10px] uppercase text-slate-400 font-bold mb-1">Dein Club Code</div>
+                        <div className="text-2xl font-mono font-bold text-slate-800 tracking-wider">#{roomCode}</div>
+                        <p className="text-xs text-slate-500 mt-2 leading-relaxed">
+                            ⚠️ Wichtig: Dieser Code muss auf <b>allen Handys exakt gleich</b> sein. Wenn er abweicht, seid ihr in unterschiedlichen Räumen.
+                        </p>
+                    </div>
+
+                    <div className="space-y-2 text-xs text-slate-500 font-mono border-t border-slate-100 pt-2">
+                        <div className="flex justify-between"><span>Status:</span> <span className={isDemo ? "text-red-500 font-bold" : "text-green-600 font-bold"}>{isDemo ? "OFFLINE" : "VERBUNDEN"}</span></div>
+                        <div className="flex justify-between"><span>User ID:</span> <span>{user?.uid?.slice(0,8)}...</span></div>
+                        <div className="flex justify-between"><span>Room ID:</span> <span title={rawAppId}>{rawAppId.slice(0,12)}...</span></div>
+                    </div>
+
+                    <div className="flex gap-2 mt-4">
+                        <button onClick={() => window.location.reload()} className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 py-3 rounded-lg font-bold text-xs transition-colors">
+                            Seite neu laden
+                        </button>
+                        {isDemo && (
+                            <button onClick={() => { localStorage.clear(); window.location.reload(); }} className="px-4 bg-red-100 text-red-700 hover:bg-red-200 py-3 rounded-lg font-bold text-xs transition-colors">
+                                Reset
+                            </button>
+                        )}
+                    </div>
+                </div>
+            </div>
+        </div>
+      )}
+
     </div>
   );
 }
 
-// --- Sub Components ---
+// ==========================================
+// SUB COMPONENTS
+// ==========================================
 
 function NavBtn({ id, active, set, icon: Icon, label }) {
   const isActive = active === id;
@@ -527,7 +527,7 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
   const sortedMembers = [...members].sort((a, b) => (b.debt || 0) - (a.debt || 0));
   const topPenalties = [...catalog].sort((a,b) => (b.count || 0) - (a.count || 0)).slice(0, 3);
 
-  // --- LOGIK FÜR LOSER DES ABENDS ---
+  // Daily Loser Logic
   const getDailyLoser = () => {
     const today = new Date().setHours(0,0,0,0);
     const todayPenalties = history.filter(h => {
@@ -536,25 +536,15 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
         const d = new Date(seconds * 1000);
         return d.setHours(0,0,0,0) === today;
     });
-
     const sums = {};
-    todayPenalties.forEach(h => {
-        const name = h.text.split(':')[0].trim();
-        sums[name] = (sums[name] || 0) + h.amount;
-    });
-
-    let loser = null;
-    let maxAmount = 0;
-    Object.entries(sums).forEach(([name, amount]) => {
-        if (amount > maxAmount) {
-            maxAmount = amount;
-            loser = name;
-        }
-    });
-
+    todayPenalties.forEach(h => { const name = h.text.split(':')[0].trim(); sums[name] = (sums[name] || 0) + h.amount; });
+    let loser = null; let maxAmount = 0;
+    Object.entries(sums).forEach(([name, amount]) => { if (amount > maxAmount) { maxAmount = amount; loser = name; } });
     return loser ? { name: loser, amount: maxAmount } : null;
   };
+  const dailyLoser = getDailyLoser();
 
+  // Stats Logic
   const getAllTimeHighscores = () => {
       const eveningSums = {}; 
       history.filter(h => h.type === 'penalty' && h.createdAt).forEach(h => {
@@ -563,18 +553,17 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
           const dateStr = date.toLocaleDateString('de-DE'); 
           const name = h.text.split(':')[0].trim();
           const key = `${dateStr}_${name}`;
-          
           if (!eveningSums[key]) eveningSums[key] = { date: dateStr, name, amount: 0 };
           eveningSums[key].amount += h.amount;
       });
       return Object.values(eveningSums).sort((a, b) => b.amount - a.amount).slice(0, 10);
   };
-
-  const dailyLoser = getDailyLoser();
   const allTimeHighscores = getAllTimeHighscores();
 
   return (
     <div className="p-4 space-y-6 animate-in fade-in slide-in-from-bottom-4">
+      
+      {/* KACHELN */}
       <div className="grid grid-cols-2 gap-3">
           <div className="bg-slate-800 text-white p-4 rounded-2xl shadow-lg border border-slate-700 relative overflow-hidden">
             <div className="absolute top-0 right-0 w-16 h-16 bg-white/5 rounded-full -mr-8 -mt-8 blur-lg"></div>
@@ -606,6 +595,7 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
           </div>
       )}
 
+      {/* TABS */}
       <div className="bg-white p-1 rounded-xl border border-slate-200 flex shadow-sm">
         <button onClick={() => setViewMode('ranking')} className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all ${viewMode === 'ranking' ? 'bg-slate-100 text-slate-900 shadow-sm' : 'text-slate-400'}`}>
           <TrendingUp className="w-3 h-3 inline mr-1"/> Ranking
@@ -618,6 +608,7 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
         </button>
       </div>
 
+      {/* RANKING LISTE */}
       {viewMode === 'ranking' && (
         <div className="space-y-3 animate-in fade-in">
           {sortedMembers.map((m, index) => {
@@ -643,6 +634,7 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
         </div>
       )}
 
+      {/* HISTORY LISTE */}
       {viewMode === 'history' && (
         <div className="space-y-0 bg-white rounded-xl border border-slate-100 shadow-sm overflow-hidden animate-in fade-in">
           {history.length > 0 ? history.map((item, i) => {
@@ -676,10 +668,11 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
         </div>
       )}
 
+      {/* STATS VIEW */}
       {viewMode === 'stats' && (
          <div className="space-y-4 animate-in fade-in">
              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-                 <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><Flame className="w-4 h-4 text-orange-500"/> Ewige Bestenliste (Top 10 Abende)</h3>
+                 <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><Flame className="w-4 h-4 text-orange-500"/> Top Abende</h3>
                  {allTimeHighscores.map((entry, i) => (
                      <div key={i} className="flex items-center justify-between py-2 border-b border-slate-50 last:border-0">
                          <div className="flex items-center gap-3">
@@ -692,9 +685,8 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
                          <div className="text-sm font-mono font-bold text-red-600">{entry.amount.toFixed(2)}€</div>
                      </div>
                  ))}
-                 {allTimeHighscores.length === 0 && <div className="text-center text-slate-400 text-xs">Noch nicht genug Daten.</div>}
+                 {allTimeHighscores.length === 0 && <div className="text-center text-slate-400 text-xs">Keine Daten.</div>}
              </div>
-
              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
                  <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><TrendingUp className="w-4 h-4 text-amber-500"/> Top Sünden</h3>
                  {topPenalties.map((p, i) => (
@@ -706,18 +698,18 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
                          <div className="text-xs bg-amber-100 text-amber-800 px-2 py-1 rounded-full font-bold">{p.count || 0}x</div>
                      </div>
                  ))}
-                 {topPenalties.length === 0 && <div className="text-center text-slate-400 text-xs">Noch keine Daten.</div>}
              </div>
          </div>
       )}
 
+      {/* EXPENSE MODAL */}
       {expenseModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in">
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in">
           <div className="bg-white rounded-2xl w-full max-w-xs p-6 shadow-2xl">
             <h3 className="font-bold mb-4 flex items-center gap-2 text-emerald-800"><Wallet className="w-5 h-5"/> Ausgabe erfassen</h3>
             <p className="text-xs text-slate-500 mb-4">Geld wird vom Kassenbestand abgezogen.</p>
             <form onSubmit={handleExpense}>
-              <input className="w-full bg-slate-50 p-3 rounded border border-slate-200 mb-3 outline-none text-sm" placeholder="Verwendungszweck (z.B. Pizza)" value={expenseTitle} onChange={e => setExpenseTitle(e.target.value)} autoFocus />
+              <input className="w-full bg-slate-50 p-3 rounded border border-slate-200 mb-3 outline-none text-sm" placeholder="Zweck (z.B. Pizza)" value={expenseTitle} onChange={e => setExpenseTitle(e.target.value)} autoFocus />
               <input type="number" step="0.01" className="w-full text-2xl font-mono border-b-2 outline-none py-2 mb-6 text-center" placeholder="0.00" value={expenseAmount} onChange={e => setExpenseAmount(e.target.value)} />
               <div className="flex gap-2">
                 <button type="button" onClick={() => setExpenseModal(false)} className="flex-1 py-3 text-slate-500 hover:text-slate-700 font-medium text-sm">Abbruch</button>
@@ -771,7 +763,7 @@ function CashierView({ members, catalog, onBook, onPay }) {
 
   return (
     <div className="p-4 space-y-6 animate-in slide-in-from-right-4">
-      {notification && <div className="fixed top-20 left-1/2 -translate-x-1/2 bg-green-600 text-white px-6 py-3 rounded-full shadow-xl z-50 font-bold text-sm whitespace-nowrap animate-in fade-in zoom-in">{notification}</div>}
+      {notification && <div className="fixed top-20 left-1/2 -translate-x-1/2 bg-green-600 text-white px-6 py-3 rounded-full shadow-xl z-50 font-bold text-sm whitespace-nowrap animate-in fade-in zoom-in flex items-center gap-2"><CheckCircle2 className="w-4 h-4" />{notification}</div>}
 
       <div>
         <h2 className="text-sm font-bold text-slate-400 uppercase tracking-wider mb-2">1. Wer ist fällig?</h2>
@@ -795,11 +787,9 @@ function CashierView({ members, catalog, onBook, onPay }) {
             ))}
             
             <button onClick={() => setManualBookModal(true)} className="bg-slate-100 p-4 min-h-[70px] rounded-xl border border-slate-200 shadow-sm hover:bg-slate-200 flex justify-between items-center active:scale-95 transition-transform group text-slate-600">
-                <span className="font-medium text-left">Manueller Eintrag</span>
+                <span className="font-medium text-left">Manuell</span>
                 <PenTool className="w-5 h-5" />
             </button>
-
-            {catalog.length === 0 && <div className="text-sm text-slate-400 col-span-2 text-center p-4 border border-dashed rounded-xl">Katalog leer.</div>}
           </div>
           
           {(activeMember.debt || 0) > 0 && (
@@ -811,8 +801,9 @@ function CashierView({ members, catalog, onBook, onPay }) {
         </div>
       )}
 
+      {/* Manual Book Modal */}
       {manualBookModal && activeMember && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in">
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in">
           <div className="bg-white rounded-2xl w-full max-w-xs p-6 shadow-2xl">
             <h3 className="font-bold mb-4">Eintrag für {activeMember.name}</h3>
             <form onSubmit={handleManualBook}>
@@ -827,8 +818,9 @@ function CashierView({ members, catalog, onBook, onPay }) {
         </div>
       )}
 
+      {/* Pay Modal */}
       {payModal && activeMember && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in">
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in">
           <div className="bg-white rounded-2xl w-full max-w-xs p-6 shadow-2xl">
             <h3 className="font-bold mb-1">Zahlen für {activeMember.name}</h3>
             <p className="text-xs text-slate-400 mb-4">Betrag ist anpassbar (Teilzahlung möglich).</p>
@@ -936,7 +928,7 @@ function MembersView({ members, onPay, onAdd, onDelete, isAdmin }) {
       </div>
 
       {payModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in">
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in">
           <div className="bg-white rounded-2xl w-full max-w-xs p-6 shadow-2xl">
             <h3 className="font-bold mb-4">Zahlen für {payModal.name}</h3>
             <form onSubmit={handlePay}>
@@ -969,21 +961,16 @@ function CatalogView({ catalog, onAdd, onDelete, isAdmin }) {
         setTitle(''); setAmount('');
     };
 
-    const del = async (id) => { 
-      await onDelete(id);
-      setDelId(null); 
-    };
+    const del = async (id) => { await onDelete(id); setDelId(null); };
 
     return (
         <div className="p-4 animate-in slide-in-from-right-4">
             <h2 className="font-bold text-lg mb-4">Strafen bearbeiten</h2>
-            
             {!isAdmin && (
               <div className="bg-amber-50 p-4 rounded-xl border border-amber-100 text-center mb-6 text-sm text-amber-800">
                 <Lock className="w-4 h-4 inline mr-1 mb-0.5" /> Nur Admins können Strafen ändern.
               </div>
             )}
-
             {isAdmin && (
               <form onSubmit={add} className="bg-white p-4 rounded-xl border border-slate-200 mb-6 shadow-sm">
                   <div className="grid grid-cols-3 gap-3 mb-3">
@@ -993,7 +980,6 @@ function CatalogView({ catalog, onAdd, onDelete, isAdmin }) {
                   <button type="submit" className="w-full bg-slate-900 text-white font-bold py-3 rounded-lg hover:bg-slate-800 transition-colors active:scale-95"><Plus className="w-4 h-4 inline" /> Hinzufügen</button>
               </form>
             )}
-
             <div className="space-y-2">
                 {catalog.map(item => (
                     <div key={item.id} className="bg-white p-3 rounded-lg border border-slate-100 flex justify-between items-center hover:shadow-sm transition-shadow">
@@ -1017,51 +1003,19 @@ function CalendarView({ events, onAdd, onDelete, isAdmin }) {
     const [loc, setLoc] = useState('');
     const [delId, setDelId] = useState(null);
 
-    const add = async (e) => {
-        e.preventDefault(); if(!date) return;
-        await onAdd(date, time, loc);
-        setDate(''); setTime(''); setLoc('');
-    };
-
-    const del = async (id) => { 
-      await onDelete(id);
-      setDelId(null); 
-    };
+    const add = async (e) => { e.preventDefault(); if(!date) return; await onAdd(date, time, loc); setDate(''); setTime(''); setLoc(''); };
+    const del = async (id) => { await onDelete(id); setDelId(null); };
 
     const handleShare = async (ev) => {
-        const d = new Date(ev.date);
-        const [hours, minutes] = ev.time.split(':');
-        d.setHours(hours, minutes);
-        const end = new Date(d);
-        end.setHours(end.getHours() + 3);
-        const formatDate = (date) => date.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
-        const icsData = `BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//KnobelKasse//DE
-BEGIN:VEVENT
-UID:${ev.id}@knobelkasse
-DTSTAMP:${formatDate(new Date())}
-DTSTART:${formatDate(d)}
-DTEND:${formatDate(end)}
-SUMMARY:Knobeln 🎲
-DESCRIPTION:Ort: ${ev.location}
-LOCATION:${ev.location}
-END:VEVENT
-END:VCALENDAR`;
-        const file = new File([icsData], 'termin.ics', { type: 'text/calendar' });
+        const d = new Date(ev.date); const [h, m] = ev.time.split(':'); d.setHours(h, m);
         const text = `📅 Knobeln am ${d.toLocaleDateString('de-DE')} um ${ev.time} Uhr in ${ev.location}`;
-        if (navigator.canShare && navigator.canShare({ files: [file] })) {
-            try { await navigator.share({ files: [file], title: 'Knobelrunde', text: text }); } catch (err) { console.error("Teilen abgebrochen", err); }
-        } else {
-             const waLink = `https://wa.me/?text=${encodeURIComponent(text)}`;
-             window.open(waLink, '_blank');
-        }
+        if (navigator.share) { try { await navigator.share({ title: 'Knobelrunde', text: text }); } catch (err) { } } 
+        else { window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank'); }
     };
 
     return (
         <div className="p-4 animate-in slide-in-from-right-4">
             <h2 className="font-bold text-lg mb-4">Termine</h2>
-            
             {isAdmin && (
               <form onSubmit={add} className="bg-white p-4 rounded-xl border border-slate-200 mb-6 space-y-3 shadow-sm">
                   <input type="date" className="w-full bg-slate-50 p-3 rounded border border-slate-200 focus:border-amber-400 outline-none transition-colors text-base" value={date} onChange={e => setDate(e.target.value)} />
@@ -1070,25 +1024,15 @@ END:VCALENDAR`;
                   <button type="submit" className="w-full bg-amber-500 text-white font-bold py-3 rounded-lg hover:bg-amber-600 transition-colors active:scale-95">Speichern</button>
               </form>
             )}
-
-            {!isAdmin && (
-              <div className="bg-blue-50 p-4 rounded-xl border border-blue-100 text-center mb-6 text-sm text-blue-800">
-                <Lock className="w-4 h-4 inline mr-1 mb-0.5" /> Nur Admins können Termine erstellen.
-              </div>
-            )}
-
+            {!isAdmin && (<div className="bg-blue-50 p-4 rounded-xl border border-blue-100 text-center mb-6 text-sm text-blue-800"><Lock className="w-4 h-4 inline mr-1 mb-0.5" /> Nur Admins können Termine erstellen.</div>)}
             <div className="space-y-4">
                 {events.map(ev => (
                     <div key={ev.id} className="bg-white p-4 rounded-xl border-l-4 border-amber-500 shadow-sm hover:shadow-md transition-shadow">
                         <div className="font-bold text-lg">{new Date(ev.date).toLocaleDateString('de-DE')}</div>
                         <div className="text-slate-500 text-sm">{ev.time} Uhr - {ev.location}</div>
                         <div className="mt-3 flex gap-2">
-                            <button onClick={() => handleShare(ev)} className="flex-1 bg-green-100 text-green-800 py-3 rounded text-center text-sm font-bold flex items-center justify-center gap-2 hover:bg-green-200 transition-colors active:scale-95">
-                                <Share2 className="w-4 h-4"/> Einladen
-                            </button>
-                            {isAdmin && (
-                              delId === ev.id ? <button onClick={() => del(ev.id)} className="px-3 bg-red-500 text-white rounded text-xs hover:bg-red-600 transition-colors active:scale-95">Weg</button> : <button onClick={() => setDelId(ev.id)} className="text-slate-300 hover:text-red-500 transition-colors p-2 active:scale-90"><Trash2 className="w-5 h-5"/></button>
-                            )}
+                            <button onClick={() => handleShare(ev)} className="flex-1 bg-green-100 text-green-800 py-3 rounded text-center text-sm font-bold flex items-center justify-center gap-2 hover:bg-green-200 transition-colors active:scale-95"><Share2 className="w-4 h-4"/> Einladen</button>
+                            {isAdmin && (delId === ev.id ? <button onClick={() => del(ev.id)} className="px-3 bg-red-500 text-white rounded text-xs hover:bg-red-600 transition-colors active:scale-95">Weg</button> : <button onClick={() => setDelId(ev.id)} className="text-slate-300 hover:text-red-500 transition-colors p-2 active:scale-90"><Trash2 className="w-5 h-5"/></button>)}
                         </div>
                     </div>
                 ))}
@@ -1097,5 +1041,4 @@ END:VCALENDAR`;
     );
 }
 
-// Finale Export-Zeile (WICHTIG!)
 export default function App() { return <ErrorBoundary><KnobelKasse /></ErrorBoundary>; }
