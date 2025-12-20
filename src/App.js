@@ -52,7 +52,9 @@ import {
   Info,
   Loader2,
   Copy,
-  CheckCircle2
+  CheckCircle2,
+  RefreshCw,
+  ArrowRight
 } from 'lucide-react';
 
 // ==========================================
@@ -68,13 +70,17 @@ const manualConfig = {
   appId: "1:610305729554:web:081b81ebb26dbf57e7a4cb"
 };
 
-let app, auth, db, configError;
+let app, auth, db, configError, currentProjectId = "unknown";
 
 try {
   let firebaseConfig = manualConfig;
+  currentProjectId = manualConfig.projectId;
+  
   if (typeof __firebase_config !== 'undefined' && __firebase_config) {
     try {
-      firebaseConfig = JSON.parse(__firebase_config);
+      const parsed = JSON.parse(__firebase_config);
+      firebaseConfig = parsed;
+      currentProjectId = parsed.projectId || "injected";
     } catch (e) {
       console.warn("Auto-Config fehlgeschlagen, nutze Fallback.");
     }
@@ -87,10 +93,8 @@ try {
   configError = e.message;
 }
 
-// Ermittle App ID sicher und erstelle einen kurzen "Club Code" für die Anzeige
-const rawAppId = typeof __app_id !== 'undefined' ? __app_id : 'knobelkasse-default-lobby';
-// Nimm die letzten 4 Zeichen der ID als "Sichtbaren Code" zur Kontrolle
-const roomCode = rawAppId.slice(-4).toUpperCase();
+// Default ID ermitteln (kann vom User überschrieben werden)
+const defaultGlobalAppId = typeof __app_id !== 'undefined' ? __app_id : 'knobelkasse-default-lobby';
 
 // ==========================================
 // HEADER GRAFIK
@@ -157,8 +161,18 @@ function KnobelKasse() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isDemo, setIsDemo] = useState(false);
   const [connectionError, setConnectionError] = useState(null); 
-  const [writeError, setWriteError] = useState(null); // Neuer State für Schreibfehler
-  const [showDebug, setShowDebug] = useState(false); // Debug Modal
+  const [writeError, setWriteError] = useState(null);
+  const [showDebug, setShowDebug] = useState(false);
+  
+  // WICHTIG: State für den aktuellen Raum (App ID)
+  // Wir laden eine gespeicherte ID oder nutzen den Standard
+  const [currentAppId, setCurrentAppId] = useState(() => {
+      try {
+          const saved = localStorage.getItem('knobel_custom_room_id');
+          return saved || defaultGlobalAppId;
+      } catch (e) { return defaultGlobalAppId; }
+  });
+  const [customRoomInput, setCustomRoomInput] = useState('');
 
   // Admin
   const [isAdmin, setIsAdmin] = useState(false);
@@ -172,6 +186,10 @@ function KnobelKasse() {
   const [history, setHistory] = useState([]);
   const [pot, setPot] = useState({ balance: 0 });
 
+  // Logs für Debugging
+  const [logs, setLogs] = useState([]);
+  const addLog = (msg) => setLogs(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 20));
+
   // 1. AUTH
   useEffect(() => {
     const initAuth = async () => {
@@ -182,9 +200,11 @@ function KnobelKasse() {
         } else {
             await signInAnonymously(auth);
         }
+        addLog("Auth: Versuch gestartet...");
       } catch (err) {
         console.error("Auth Fail:", err);
         setConnectionError(err.message);
+        addLog(`Auth Fehler: ${err.message}`);
         setIsDemo(true); 
       }
     };
@@ -194,11 +214,12 @@ function KnobelKasse() {
             setUser(u);
             setConnectionError(null);
             setIsDemo(false);
+            addLog(`Auth OK: ${u.uid.slice(0,5)}...`);
         }
     });
   }, []);
 
-  // 2. DATA SYNC
+  // 2. DATA SYNC (Reagiert auf currentAppId Änderungen!)
   useEffect(() => {
     if ((!user && !isDemo) || !db) return;
 
@@ -207,8 +228,10 @@ function KnobelKasse() {
         return;
     }
 
-    // ONLINE PFAD - Nutzen strikt artifacts/{rawAppId}/public/data
-    const getPath = (col) => collection(db, 'artifacts', rawAppId, 'public', 'data', col);
+    addLog(`Verbinde zu Raum: ${currentAppId}`);
+    
+    // ONLINE PFAD - Dynamisch basierend auf State
+    const getPath = (col) => collection(db, 'artifacts', currentAppId, 'public', 'data', col);
 
     const safeSnapshot = (colName, setter) => {
       return onSnapshot(getPath(colName), (snap) => {
@@ -222,9 +245,12 @@ function KnobelKasse() {
               setter(data.length > 0 ? data[0] : { balance: 0 }); return;
           }
           setter(data);
+          // Logging nur beim ersten Laden oder Änderungen, um Spam zu vermeiden
+          if(data.length > 0) addLog(`${colName}: ${data.length} Items geladen.`);
         },
         (err) => {
             console.error(`Read Error ${colName}:`, err);
+            addLog(`Fehler ${colName}: ${err.message}`);
             if (err.code === 'permission-denied') {
                 setConnectionError("Keine Leserechte (Server blockiert)");
                 setIsDemo(true);
@@ -242,7 +268,7 @@ function KnobelKasse() {
     ];
 
     return () => unsubs.forEach(u => u && u());
-  }, [user, isDemo]);
+  }, [user, isDemo, currentAppId]); // Re-Run wenn Raum geändert wird
 
   // LOCAL LOAD
   const loadLocalData = () => {
@@ -252,30 +278,52 @@ function KnobelKasse() {
       setEvents(load('events', []));
       setHistory(load('history', []));
       setPot(load('pot', { balance: 0 }));
+      addLog("Lokale Daten geladen.");
   };
 
   // 3. ACTIONS & ERROR HANDLING
-  const getCol = (name) => collection(db, 'artifacts', rawAppId, 'public', 'data', name);
-  const getDocRef = (name, id) => doc(db, 'artifacts', rawAppId, 'public', 'data', name, id);
+  const getCol = (name) => collection(db, 'artifacts', currentAppId, 'public', 'data', name);
+  const getDocRef = (name, id) => doc(db, 'artifacts', currentAppId, 'public', 'data', name, id);
   const saveLocal = (k, d) => localStorage.setItem(`knobel_${k}`, JSON.stringify(d));
 
-  // Wrapper für alle Schreibzugriffe mit Fehleranzeige
   const safeWrite = async (operationName, operationFn) => {
       setWriteError(null);
       if (isDemo) {
-          try { await operationFn(); } catch(e) { console.error("Local Error", e); }
+          try { await operationFn(); addLog(`Lokal: ${operationName}`); } catch(e) { console.error("Local Error", e); }
           return;
       }
       try {
           await operationFn();
+          addLog(`Erfolg: ${operationName}`);
       } catch (e) {
           console.error(`Write Error (${operationName}):`, e);
           setWriteError(`Fehler beim Speichern (${operationName}): ${e.message}`);
-          // Optional: Nach 5 Sekunden Fehler ausblenden
+          addLog(`Fehler Write: ${e.message}`);
           setTimeout(() => setWriteError(null), 8000);
       }
   };
 
+  const handleRoomChange = (e) => {
+      e.preventDefault();
+      if (!customRoomInput.trim()) return;
+      // Sanitize ID
+      const newId = customRoomInput.trim().replace(/[^a-zA-Z0-9-_]/g, '');
+      if (newId.length < 3) { alert("Zu kurz!"); return; }
+      
+      localStorage.setItem('knobel_custom_room_id', newId);
+      setCurrentAppId(newId);
+      setCustomRoomInput('');
+      addLog(`Raum gewechselt zu: ${newId}`);
+      // Reload erzwingen für sauberen Status
+      setTimeout(() => window.location.reload(), 500);
+  };
+
+  const resetRoom = () => {
+      localStorage.removeItem('knobel_custom_room_id');
+      window.location.reload();
+  }
+
+  // Action Wrappers
   const bookPenalty = (mId, mName, title, amount, cId) => safeWrite('Strafe buchen', async () => {
     if (isDemo) {
         const nM = members.map(m => m.id === mId ? { ...m, debt: (m.debt||0)+amount } : m);
@@ -313,11 +361,7 @@ function KnobelKasse() {
   });
 
   const handleAddMember = (name) => safeWrite('Mitglied +', async () => {
-      if(isDemo) {
-          const nM = [...members, { id: Date.now().toString(), name, debt: 0 }];
-          setMembers(nM); saveLocal('members', nM);
-          return;
-      }
+      if(isDemo) { const nM = [...members, { id: Date.now().toString(), name, debt: 0 }]; setMembers(nM); saveLocal('members', nM); return; }
       await addDoc(getCol('knobel_members'), { name, debt: 0, createdAt: serverTimestamp() });
   });
 
@@ -346,7 +390,6 @@ function KnobelKasse() {
       await deleteDoc(getDocRef('knobel_events', id));
   });
 
-  // UI HELPER
   const handleAdminLogin = (e) => {
     e.preventDefault();
     if (e.target.pin.value === ADMIN_PIN) { setIsAdmin(true); setShowAdminLogin(false); } 
@@ -356,12 +399,13 @@ function KnobelKasse() {
   if (!user && !isDemo) return (
     <div className="flex flex-col h-screen items-center justify-center bg-slate-900 text-white p-6 text-center">
         <Loader2 className="w-12 h-12 animate-spin text-amber-500 mb-4" />
-        <p className="animate-pulse mb-2 text-lg font-bold">Verbinde...</p>
-        <p className="text-xs text-slate-500">Raum: {roomCode}</p>
+        <p className="animate-pulse mb-2 text-lg font-bold">Lade Knobelkasse...</p>
+        <p className="text-xs text-slate-500 font-mono">ID: {currentAppId.slice(0,8)}...</p>
     </div>
   );
 
   const totalDebt = members.reduce((acc, m) => acc + (m.debt || 0), 0);
+  const displayCode = currentAppId.slice(-4).toUpperCase();
 
   return (
     <div className="flex flex-col h-screen bg-slate-50 font-sans text-slate-800 w-full relative overflow-hidden">
@@ -381,10 +425,9 @@ function KnobelKasse() {
           </div>
           
           <div className="flex items-center gap-2">
-             {/* VISUAL ROOM CODE - ESSENTIEL FÜR SYNC CHECK */}
-             <div className="flex flex-col items-end mr-2">
-                 <span className="text-[9px] text-slate-400 uppercase tracking-widest">Club Code</span>
-                 <span className="text-sm font-mono font-bold text-amber-400 select-all">#{roomCode}</span>
+             <div className="flex flex-col items-end mr-2 cursor-pointer" onClick={() => setShowDebug(true)}>
+                 <span className="text-[9px] text-slate-400 uppercase tracking-widest">Code</span>
+                 <span className="text-sm font-mono font-bold text-amber-400 select-all flex items-center gap-1">#{displayCode}</span>
              </div>
 
              <button 
@@ -397,7 +440,7 @@ function KnobelKasse() {
         </div>
       </header>
 
-      {/* ERROR TOAST - SEHR WICHTIG FÜR FEEDBACK */}
+      {/* ERROR TOAST */}
       {writeError && (
           <div className="bg-red-600 text-white p-4 text-center font-bold text-sm shadow-xl z-50 animate-in slide-in-from-top fixed top-20 left-4 right-4 rounded-xl flex items-center gap-3 border-2 border-white/20">
               <AlertCircle className="w-6 h-6 shrink-0" />
@@ -409,7 +452,7 @@ function KnobelKasse() {
       {/* OFFLINE BANNER */}
       {isDemo && (
           <div className="bg-red-500 text-white px-4 py-2 text-center text-xs font-bold shadow-md flex justify-between items-center z-40 relative">
-              <span className="flex items-center gap-1"><Info className="w-4 h-4"/> Offline-Modus (Lokal)</span>
+              <span className="flex items-center gap-1"><Info className="w-4 h-4"/> Offline (Lokal)</span>
           </div>
       )}
 
@@ -453,34 +496,56 @@ function KnobelKasse() {
 
       {/* DEBUG / CONNECTION MODAL */}
       {showDebug && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in">
-            <div className="bg-white rounded-2xl w-full max-w-sm p-6 shadow-2xl relative overflow-hidden">
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in overflow-y-auto">
+            <div className="bg-white rounded-2xl w-full max-w-sm p-6 shadow-2xl relative overflow-hidden my-4">
                 <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-amber-400 to-amber-600"></div>
                 <button onClick={() => setShowDebug(false)} className="absolute top-2 right-2 p-2 text-slate-400 hover:text-slate-600"><X className="w-5 h-5"/></button>
                 
-                <h3 className="font-bold text-lg mb-4 flex items-center gap-2">
-                    {isDemo ? <WifiOff className="text-red-500"/> : <Wifi className="text-green-500"/>}
-                    Verbindungsstatus
+                <h3 className="font-bold text-lg mb-4 flex items-center gap-2 text-slate-800">
+                    <Settings className="w-5 h-5"/> Einstellungen & Debug
                 </h3>
                 
                 <div className="space-y-4 text-sm">
-                    <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
-                        <div className="text-[10px] uppercase text-slate-400 font-bold mb-1">Dein Club Code</div>
-                        <div className="text-2xl font-mono font-bold text-slate-800 tracking-wider">#{roomCode}</div>
-                        <p className="text-xs text-slate-500 mt-2 leading-relaxed">
-                            ⚠️ Wichtig: Dieser Code muss auf <b>allen Handys exakt gleich</b> sein. Wenn er abweicht, seid ihr in unterschiedlichen Räumen.
+                    {/* MANUAL ROOM OVERRIDE */}
+                    <div className="bg-amber-50 p-4 rounded-xl border border-amber-200">
+                        <label className="text-xs uppercase font-bold text-amber-700 block mb-2">Manuelle Raum-ID</label>
+                        <p className="text-xs text-amber-800/70 mb-3">
+                            Wenn Sync nicht geht: Gib hier auf allen Handys <b>exakt das gleiche Wort</b> ein (z.B. "MeinClub").
                         </p>
+                        <form onSubmit={handleRoomChange} className="flex gap-2">
+                            <input 
+                                className="flex-1 p-2 rounded border border-amber-300 text-sm outline-none focus:border-amber-500 bg-white" 
+                                placeholder="Eigener Code..." 
+                                value={customRoomInput}
+                                onChange={e => setCustomRoomInput(e.target.value)}
+                            />
+                            <button type="submit" className="bg-amber-500 text-white px-3 py-2 rounded font-bold text-xs hover:bg-amber-600 transition-colors">
+                                Wechseln
+                            </button>
+                        </form>
+                        {currentAppId !== defaultGlobalAppId && (
+                            <button onClick={resetRoom} className="text-xs text-red-500 underline mt-2 hover:text-red-700">Zurück zum Standard</button>
+                        )}
                     </div>
 
-                    <div className="space-y-2 text-xs text-slate-500 font-mono border-t border-slate-100 pt-2">
-                        <div className="flex justify-between"><span>Status:</span> <span className={isDemo ? "text-red-500 font-bold" : "text-green-600 font-bold"}>{isDemo ? "OFFLINE" : "VERBUNDEN"}</span></div>
-                        <div className="flex justify-between"><span>User ID:</span> <span>{user?.uid?.slice(0,8)}...</span></div>
-                        <div className="flex justify-between"><span>Room ID:</span> <span title={rawAppId}>{rawAppId.slice(0,12)}...</span></div>
+                    <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                        <div className="text-[10px] uppercase text-slate-400 font-bold mb-1">Technische Details</div>
+                        <div className="space-y-1 text-xs font-mono text-slate-600">
+                             <div className="flex justify-between"><span>Status:</span> <span className={isDemo ? "text-red-500 font-bold" : "text-green-600 font-bold"}>{isDemo ? "OFFLINE" : "ONLINE"}</span></div>
+                             <div className="flex justify-between"><span>Project:</span> <span>{currentProjectId}</span></div>
+                             <div className="flex justify-between overflow-hidden"><span>Full Room ID:</span> <span className="truncate ml-2" title={currentAppId}>{currentAppId}</span></div>
+                             <div className="flex justify-between"><span>Docs Loaded:</span> <span>{members.length + history.length + events.length}</span></div>
+                        </div>
                     </div>
 
-                    <div className="flex gap-2 mt-4">
-                        <button onClick={() => window.location.reload()} className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 py-3 rounded-lg font-bold text-xs transition-colors">
-                            Seite neu laden
+                    <div className="bg-slate-900 text-slate-300 p-3 rounded-lg border border-slate-700 h-32 overflow-y-auto font-mono text-[10px]">
+                        {logs.length === 0 && <div className="text-slate-600 italic">Keine Logs...</div>}
+                        {logs.map((l, i) => <div key={i} className="border-b border-slate-800 last:border-0 pb-1 mb-1">{l}</div>)}
+                    </div>
+
+                    <div className="flex gap-2 mt-2">
+                        <button onClick={() => window.location.reload()} className="flex-1 bg-slate-200 hover:bg-slate-300 text-slate-700 py-3 rounded-lg font-bold text-xs transition-colors flex items-center justify-center gap-2">
+                            <RefreshCw className="w-4 h-4" /> Reload App
                         </button>
                         {isDemo && (
                             <button onClick={() => { localStorage.clear(); window.location.reload(); }} className="px-4 bg-red-100 text-red-700 hover:bg-red-200 py-3 rounded-lg font-bold text-xs transition-colors">
