@@ -49,7 +49,8 @@ import {
   Crown,
   Flame,
   Wifi,
-  WifiOff
+  WifiOff,
+  Database
 } from 'lucide-react';
 
 // ==========================================
@@ -162,6 +163,7 @@ function KnobelKasse() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isDemo, setIsDemo] = useState(false);
   const [connectionError, setConnectionError] = useState(null); 
+  const [detailedError, setDetailedError] = useState(null);
   
   // Admin State
   const [isAdmin, setIsAdmin] = useState(false);
@@ -179,14 +181,30 @@ function KnobelKasse() {
   useEffect(() => {
     const initAuth = async () => {
       try {
+        // Zuerst versuchen wir den Token der Umgebung
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
           await signInWithCustomToken(auth, __initial_auth_token);
         } else {
+          // Sonst anonyme Anmeldung (benötigt Aktivierung in Firebase Console!)
           await signInAnonymously(auth);
         }
       } catch (err) {
         console.error("Auth fehlgeschlagen:", err);
-        setConnectionError(`Anmeldefehler: ${err.message}`);
+        
+        let msg = err.message;
+        let detail = "";
+        
+        // Spezifische Fehleranalyse für den User
+        if (err.code === 'auth/operation-not-allowed') {
+            msg = "Anonyme Anmeldung deaktiviert!";
+            detail = "Gehe in Firebase Console -> Authentication -> Sign-in method und aktiviere 'Anonymous'.";
+        } else if (err.code === 'auth/api-key-not-valid') {
+            msg = "API Key ungültig!";
+            detail = "Prüfe den API Key in der Konfiguration.";
+        }
+
+        setConnectionError(msg);
+        setDetailedError(detail);
         setIsDemo(true);
       }
     };
@@ -196,6 +214,7 @@ function KnobelKasse() {
         if (u) {
             setUser(u);
             setConnectionError(null);
+            setDetailedError(null);
         }
     });
   }, []);
@@ -251,7 +270,17 @@ function KnobelKasse() {
         },
         (err) => {
             console.error(`Ladefehler ${colName}:`, err);
-            setConnectionError(`Datenbankfehler (${colName}): ${err.message}`);
+            
+            let msg = `Datenbankfehler (${colName})`;
+            let detail = err.message;
+
+            if (err.code === 'permission-denied') {
+                msg = "Datenbank Zugriff Verweigert!";
+                detail = "Gehe in Firebase Console -> Firestore Database -> Rules. Erlaube Zugriff (z.B. 'allow read, write: if true;').";
+            }
+
+            setConnectionError(msg);
+            setDetailedError(detail);
         }
       );
     };
@@ -388,9 +417,13 @@ function KnobelKasse() {
 
       {/* FEHLERMELDUNG BEI VERBINDUNGSPROBLEMEN */}
       {connectionError && (
-          <div className="bg-red-600 text-white px-4 py-3 text-center text-sm font-bold flex items-center justify-center gap-2 shadow-lg">
-              <AlertCircle className="w-5 h-5 shrink-0" />
-              <span>{connectionError}</span>
+          <div className="bg-red-50 border-b border-red-200 text-red-900 px-4 py-4 text-sm font-bold flex flex-col gap-1 shadow-lg animate-in slide-in-from-top-2">
+              <div className="flex items-center gap-2">
+                <AlertCircle className="w-5 h-5 shrink-0 text-red-600" />
+                <span className="uppercase tracking-wider">Fehler: {connectionError}</span>
+              </div>
+              {detailedError && <p className="ml-7 text-xs font-normal text-red-700">{detailedError}</p>}
+              <div className="ml-7 mt-1 text-[10px] uppercase font-bold text-red-400">Daten werden NICHT gespeichert.</div>
           </div>
       )}
 
