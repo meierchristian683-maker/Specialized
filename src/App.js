@@ -55,14 +55,15 @@ import {
   Database,
   Globe,
   Info,
-  ExternalLink
+  ExternalLink,
+  Loader2
 } from 'lucide-react';
 
 // ==========================================
-// 1. KONFIGURATION (DEIN PROJEKT)
+// 1. KONFIGURATION (Hybrid mit Fallback)
 // ==========================================
 
-const firebaseConfig = {
+const manualConfig = {
   apiKey: "AIzaSyD7iO59TiZVG8vhHpapmpO-IHID8jX_dzE",
   authDomain: "specialized-4b4c4.firebaseapp.com",
   projectId: "specialized-4b4c4",
@@ -71,13 +72,39 @@ const firebaseConfig = {
   appId: "1:610305729554:web:081b81ebb26dbf57e7a4cb"
 };
 
-// Initialisierung
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
+let app, auth, db, configError, isManualMode = false;
 
-// FIX: appId definieren, damit die Views nicht abstürzen
-const appId = "specialized-4b4c4";
+try {
+  let firebaseConfig;
+  
+  // 1. Versuch: Automatische Umgebungsvariable
+  if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+    try {
+      firebaseConfig = JSON.parse(__firebase_config);
+      isManualMode = false;
+    } catch (e) {
+      console.warn("Auto-Config Parse Fehler, nutze Fallback.");
+      firebaseConfig = manualConfig;
+      isManualMode = true;
+    }
+  } else {
+    // 2. Versuch: Manuelle Konfiguration (Fallback)
+    console.warn("Keine Umgebungskonfiguration gefunden. Nutze manuelles Projekt.");
+    firebaseConfig = manualConfig;
+    isManualMode = true;
+  }
+
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
+  
+} catch (e) {
+  console.error("Firebase Init Error:", e);
+  configError = e.message;
+}
+
+// App ID Fallback (wichtig um 'appId is not defined' zu verhindern)
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'knobelkasse-manual';
 
 // ==========================================
 // 2. HEADER GRAFIK
@@ -139,11 +166,13 @@ class ErrorBoundary extends React.Component {
 // ==========================================
 
 function KnobelKasse() {
+  if (configError) throw new Error("Initialisierungsfehler: " + configError);
+
   const [user, setUser] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isDemo, setIsDemo] = useState(false);
   const [connectionError, setConnectionError] = useState(null); 
-  const [authErrorType, setAuthErrorType] = useState(null); // 'auth-disabled' | 'network' | 'other'
+  const [authErrorType, setAuthErrorType] = useState(null);
   
   // Admin State
   const [isAdmin, setIsAdmin] = useState(false);
@@ -162,7 +191,12 @@ function KnobelKasse() {
     const initAuth = async () => {
       try {
         await setPersistence(auth, browserLocalPersistence);
-        await signInAnonymously(auth);
+        
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+            await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+            await signInAnonymously(auth);
+        }
       } catch (err) {
         console.error("Auth Fehler:", err);
         
@@ -170,16 +204,16 @@ function KnobelKasse() {
         let type = 'other';
         
         if (err.code === 'auth/operation-not-allowed') {
-            msg = "Anonyme Anmeldung ist in Firebase deaktiviert!";
+            msg = "Anonyme Anmeldung deaktiviert! (Firebase Console)";
             type = 'auth-disabled';
         } else if (err.code === 'auth/network-request-failed') {
-            msg = "Netzwerkfehler - Keine Verbindung zu Firebase.";
+            msg = "Keine Verbindung zum Server.";
             type = 'network';
         }
 
         setConnectionError(msg);
         setAuthErrorType(type);
-        setIsDemo(true); // Fallback zu Demo, damit App nicht crasht
+        setIsDemo(true); 
       }
     };
     initAuth();
@@ -189,12 +223,12 @@ function KnobelKasse() {
             setUser(u);
             setConnectionError(null);
             setAuthErrorType(null);
-            setIsDemo(false); // Wenn User da ist, kein Demo Modus!
+            setIsDemo(false);
         }
     });
   }, []);
 
-  // 2. Data Loading (ROOT PATHS - Einfachste Struktur)
+  // 2. Data Loading
   useEffect(() => {
     if (!user && !isDemo) return;
 
@@ -210,14 +244,20 @@ function KnobelKasse() {
 
     if (!db) return;
 
-    // HELPER: Wir schreiben direkt in den Root der Datenbank
-    const getSafeCol = (colName) => collection(db, colName);
+    // HELPER: Intelligente Pfadwahl
+    const getSafeCol = (colName) => {
+        if (isManualMode) {
+            return collection(db, colName); // Manuell: Direkt in Root
+        }
+        return collection(db, 'artifacts', appId, 'public', 'data', colName); // Auto: Artifacts Path
+    }
 
     const safeSnapshot = (colName, setter) => {
-      return onSnapshot(getSafeCol(colName), (snap) => {
+      const colRef = getSafeCol(colName);
+      
+      return onSnapshot(colRef, (snap) => {
           const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
           
-          // Client-Sortierung
           if (colName === 'knobel_members') data.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
           if (colName === 'knobel_history') {
              data.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
@@ -256,30 +296,40 @@ function KnobelKasse() {
     };
   }, [user, isDemo]);
 
-  // Actions
+  // Helper für Aktionen (Passend zum Lade-Pfad)
+  const getCol = (name) => {
+      if (isManualMode) return collection(db, name);
+      return collection(db, 'artifacts', appId, 'public', 'data', name);
+  }
+  const getDocRef = (name, id) => {
+      if (isManualMode) return doc(db, name, id);
+      return doc(db, 'artifacts', appId, 'public', 'data', name, id);
+  }
+
+  // ACTIONS
   const bookPenalty = async (memberId, memberName, penaltyTitle, amount, catalogId) => {
     if (isDemo) return;
     try {
-      await updateDoc(doc(db, 'knobel_members', memberId), { debt: increment(amount) });
-      if (catalogId) await updateDoc(doc(db, 'knobel_catalog', catalogId), { count: increment(1) });
-      await addDoc(collection(db, 'knobel_history'), { text: `${memberName}: ${penaltyTitle}`, amount, type: 'penalty', createdAt: serverTimestamp() });
+      await updateDoc(getDocRef('knobel_members', memberId), { debt: increment(amount) });
+      if (catalogId) await updateDoc(getDocRef('knobel_catalog', catalogId), { count: increment(1) });
+      await addDoc(getCol('knobel_history'), { text: `${memberName}: ${penaltyTitle}`, amount, type: 'penalty', createdAt: serverTimestamp() });
     } catch (e) { console.error(e); }
   };
 
   const payDebt = async (memberId, memberName, amount) => {
     if (isDemo) return;
     try {
-      await updateDoc(doc(db, 'knobel_members', memberId), { debt: increment(-amount) });
-      await setDoc(doc(db, 'knobel_pot', 'main'), { balance: increment(amount) }, { merge: true });
-      await addDoc(collection(db, 'knobel_history'), { text: `${memberName} hat eingezahlt`, amount: -amount, type: 'payment', createdAt: serverTimestamp() });
+      await updateDoc(getDocRef('knobel_members', memberId), { debt: increment(-amount) });
+      await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(amount) }, { merge: true });
+      await addDoc(getCol('knobel_history'), { text: `${memberName} hat eingezahlt`, amount: -amount, type: 'payment', createdAt: serverTimestamp() });
     } catch (e) { console.error(e); }
   };
 
   const bookExpense = async (title, amount) => {
       if (isDemo) return;
       try {
-        await setDoc(doc(db, 'knobel_pot', 'main'), { balance: increment(-amount) }, { merge: true });
-        await addDoc(collection(db, 'knobel_history'), { text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: serverTimestamp() });
+        await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(-amount) }, { merge: true });
+        await addDoc(getCol('knobel_history'), { text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: serverTimestamp() });
       } catch (e) { console.error(e); }
   }
 
@@ -308,7 +358,13 @@ function KnobelKasse() {
   // Views
   const totalDebt = members.reduce((acc, m) => acc + (m.debt || 0), 0);
 
-  if (!user && !connectionError && !isDemo) return <div className="flex h-screen items-center justify-center bg-slate-900 text-white"><p className="animate-pulse">Lade Specialized-App...</p></div>;
+  if (!user && !connectionError && !isDemo) return (
+    <div className="flex flex-col h-screen items-center justify-center bg-slate-900 text-white p-6 text-center">
+        <Loader2 className="w-12 h-12 animate-spin text-amber-500 mb-4" />
+        <p className="animate-pulse mb-2 text-lg font-bold">Lade Datenbank...</p>
+        <p className="text-sm text-slate-400">Modus: {isManualMode ? 'Dediziert' : 'Automatisch'}</p>
+    </div>
+  );
 
   return (
     <div className="flex flex-col h-screen bg-slate-50 font-sans text-slate-800 w-full relative overflow-hidden">
@@ -329,30 +385,32 @@ function KnobelKasse() {
 
       {/* KRITISCHE FEHLERMELDUNGEN */}
       {authErrorType === 'auth-disabled' && (
-          <div className="bg-red-600 text-white p-4 text-center animate-in slide-in-from-top-2 z-50">
-              <h3 className="font-bold text-lg mb-1 flex items-center justify-center gap-2"><AlertCircle /> Speichern blockiert!</h3>
-              <p className="text-sm opacity-90 mb-3">Die "Anonyme Anmeldung" ist in deiner Datenbank deaktiviert.</p>
-              <div className="bg-white/10 p-3 rounded text-left text-xs font-mono mb-3">
-                  1. Gehe zu <a href="https://console.firebase.google.com/" target="_blank" className="underline font-bold">Firebase Console</a><br/>
-                  2. Wähle dein Projekt "specialized-4b4c4"<br/>
-                  3. Klicke links auf <b>Build</b> {'>'} <b>Authentication</b><br/>
-                  4. Tab <b>Sign-in method</b> {'>'} <b>Anonymous</b> aktivieren.
+          <div className="bg-red-600 text-white px-4 py-3 text-center text-sm font-bold shadow-md animate-in slide-in-from-top-2 z-50 flex flex-col gap-1">
+              <div className="flex items-center justify-center gap-2">
+                <AlertCircle className="w-5 h-5 shrink-0" />
+                <span>Speichern blockiert!</span>
               </div>
-              <div className="text-[10px] uppercase font-bold bg-white/20 inline-block px-2 py-1 rounded">Bitte aktivieren und Seite neu laden</div>
+              <div className="text-xs font-normal opacity-90">
+                  Bitte in Firebase Console {'>'} Authentication {'>'} Sign-in method {'>'} <b>Anonymous</b> aktivieren.
+              </div>
           </div>
       )}
 
       {authErrorType === 'rules' && (
-          <div className="bg-orange-500 text-white p-4 text-center animate-in slide-in-from-top-2 z-50">
-              <h3 className="font-bold text-lg mb-1">Keine Schreibrechte!</h3>
-              <p className="text-sm">Deine Firestore Rules blockieren den Zugriff.</p>
-              <div className="text-xs mt-2 bg-black/20 p-2 rounded">Setze Rules auf: <code>allow read, write: if true;</code></div>
+          <div className="bg-orange-500 text-white px-4 py-3 text-center text-sm font-bold shadow-md animate-in slide-in-from-top-2 z-50">
+              <div className="flex items-center justify-center gap-2">
+                <ShieldCheck className="w-5 h-5 shrink-0" />
+                <span>Keine Schreibrechte</span>
+              </div>
+              <div className="text-xs font-normal mt-1 opacity-90">
+                  Setze Firestore Rules auf: <code>allow read, write: if true;</code>
+              </div>
           </div>
       )}
       
-      {!authErrorType && isDemo && (
+      {!authErrorType && isDemo && !connectionError && (
           <div className="bg-amber-500 text-white px-4 py-2 text-center text-xs font-bold shadow-md">
-              ACHTUNG: DEMO MODUS - DATEN WERDEN NICHT GESPEICHERT!
+              DEMO MODUS (Offline)
           </div>
       )}
 
@@ -361,17 +419,17 @@ function KnobelKasse() {
         <div className="max-w-2xl mx-auto w-full">
           {activeTab === 'dashboard' && <DashboardView members={members} history={history} totalDebt={totalDebt} pot={pot} onExpense={bookExpense} catalog={catalog} isAdmin={isAdmin} />}
           {activeTab === 'kasse' && <CashierView members={members} catalog={catalog} onBook={bookPenalty} onPay={payDebt} />}
-          {activeTab === 'members' && <MembersView members={members} onPay={payDebt} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('members', i)} onDemoDelete={(id)=>deleteDemoItem('members', id)} isAdmin={isAdmin} />}
-          {activeTab === 'settings' && <CatalogView catalog={catalog} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('catalog', i)} onDemoDelete={(id)=>deleteDemoItem('catalog', id)} isAdmin={isAdmin} />}
-          {activeTab === 'calendar' && <CalendarView events={events} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('events', i)} onDemoDelete={(id)=>deleteDemoItem('events', id)} isAdmin={isAdmin} />}
+          {activeTab === 'members' && <MembersView members={members} onPay={payDebt} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('members', i)} onDemoDelete={(id)=>deleteDemoItem('members', id)} isManualMode={isManualMode} isAdmin={isAdmin} />}
+          {activeTab === 'settings' && <CatalogView catalog={catalog} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('catalog', i)} onDemoDelete={(id)=>deleteDemoItem('catalog', id)} isManualMode={isManualMode} isAdmin={isAdmin} />}
+          {activeTab === 'calendar' && <CalendarView events={events} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('events', i)} onDemoDelete={(id)=>deleteDemoItem('events', id)} isManualMode={isManualMode} isAdmin={isAdmin} />}
         </div>
       </main>
 
-      {/* FOOTER DEBUG INFO */}
+      {/* FOOTER DEBUG */}
       <div className="bg-slate-100 p-2 text-[10px] text-slate-400 text-center border-t border-slate-200">
-          Projekt: specialized-4b4c4 • 
-          Status: {isDemo ? '⚠️ Offline/Demo' : '✅ Online/Live'} • 
-          User: {user ? 'Angemeldet' : 'Keiner'}
+          DB: {isManualMode ? 'Manuell' : 'Auto'} • 
+          Status: {isDemo ? 'Lokal' : 'Online'} •
+          {authErrorType ? ' FEHLER!' : ' Bereit'}
       </div>
 
       <nav className="bg-white border-t border-slate-200 absolute bottom-0 w-full z-20 pb-6 pt-2">
@@ -749,7 +807,7 @@ function CashierView({ members, catalog, onBook, onPay }) {
   );
 }
 
-function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelete, isAdmin }) {
+function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelete, isManualMode, isAdmin }) {
   const [payModal, setPayModal] = useState(null);
   const [payAmount, setPayAmount] = useState('');
   const [newMemberName, setNewMemberName] = useState('');
@@ -762,7 +820,8 @@ function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelet
     if (isDemo) onDemoAdd({ name: newMemberName });
     else {
         // Safe check
-        await addDoc(collection(db, 'knobel_members'), { name: newMemberName, debt: 0, createdAt: serverTimestamp() });
+        const col = isManualMode ? collection(db, 'knobel_members') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_members');
+        await addDoc(col, { name: newMemberName, debt: 0, createdAt: serverTimestamp() });
     }
     setNewMemberName(''); setShowAdd(false);
   };
@@ -770,7 +829,9 @@ function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelet
   const deleteMember = async (id) => {
     if (isDemo) onDemoDelete(id);
     else {
-        await deleteDoc(doc(db, 'knobel_members', id));
+        // Safe check
+        const docRef = isManualMode ? doc(db, 'knobel_members', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_members', id);
+        await deleteDoc(docRef);
     }
     setDeleteId(null);
   };
@@ -863,7 +924,7 @@ function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelet
   );
 }
 
-function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, isAdmin }) {
+function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, isManualMode, isAdmin }) {
     const [title, setTitle] = useState('');
     const [amount, setAmount] = useState('');
     const [delId, setDelId] = useState(null);
@@ -873,7 +934,8 @@ function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, isAd
         if(!title || !amount) return;
         if (isDemo) onDemoAdd({ title, amount: parseFloat(amount) });
         else {
-            await addDoc(collection(db, 'knobel_catalog'), { title, amount: parseFloat(amount), createdAt: serverTimestamp(), count: 0 });
+            const col = isManualMode ? collection(db, 'knobel_catalog') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog');
+            await addDoc(col, { title, amount: parseFloat(amount), createdAt: serverTimestamp(), count: 0 });
         }
         setTitle(''); setAmount('');
     };
@@ -881,7 +943,8 @@ function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, isAd
     const del = async (id) => { 
       if (isDemo) onDemoDelete(id);
       else {
-          await deleteDoc(doc(db, 'knobel_catalog', id)); 
+          const docRef = isManualMode ? doc(db, 'knobel_catalog', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog', id);
+          await deleteDoc(docRef); 
       }
       setDelId(null); 
     };
@@ -923,7 +986,7 @@ function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, isAd
     );
 }
 
-function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, isAdmin }) {
+function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, isManualMode, isAdmin }) {
     const [date, setDate] = useState('');
     const [time, setTime] = useState('');
     const [loc, setLoc] = useState('');
@@ -933,7 +996,8 @@ function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, isAd
         e.preventDefault(); if(!date) return;
         if (isDemo) onDemoAdd({ date, time, location: loc });
         else {
-            await addDoc(collection(db, 'knobel_events'), { date, time, location: loc, createdAt: serverTimestamp() });
+            const col = isManualMode ? collection(db, 'knobel_events') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_events');
+            await addDoc(col, { date, time, location: loc, createdAt: serverTimestamp() });
         }
         setDate(''); setTime(''); setLoc('');
     };
@@ -941,7 +1005,8 @@ function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, isAd
     const del = async (id) => { 
       if (isDemo) onDemoDelete(id);
       else {
-          await deleteDoc(doc(db, 'knobel_events', id)); 
+          const docRef = isManualMode ? doc(db, 'knobel_events', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_events', id);
+          await deleteDoc(docRef); 
       }
       setDelId(null); 
     };
