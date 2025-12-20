@@ -57,11 +57,12 @@ import {
   Info,
   ExternalLink,
   Loader2,
-  Save
+  Save,
+  RefreshCw
 } from 'lucide-react';
 
 // ==========================================
-// 1. KONFIGURATION (Hybrid mit Fallback)
+// 1. KONFIGURATION (Robust)
 // ==========================================
 
 const manualConfig = {
@@ -73,26 +74,18 @@ const manualConfig = {
   appId: "1:610305729554:web:081b81ebb26dbf57e7a4cb"
 };
 
-let app, auth, db, configError, isManualMode = false;
+let app, auth, db, configError;
 
 try {
-  let firebaseConfig;
+  let firebaseConfig = manualConfig;
   
-  // 1. Versuch: Automatische Umgebungsvariable
+  // Versuche Umgebungskonfiguration, falle aber sicher zurück
   if (typeof __firebase_config !== 'undefined' && __firebase_config) {
     try {
       firebaseConfig = JSON.parse(__firebase_config);
-      isManualMode = false;
     } catch (e) {
-      console.warn("Auto-Config Parse Fehler, nutze Fallback.");
-      firebaseConfig = manualConfig;
-      isManualMode = true;
+      console.warn("Auto-Config fehlgeschlagen, nutze Fallback.");
     }
-  } else {
-    // 2. Versuch: Manuelle Konfiguration (Fallback)
-    console.warn("Keine Umgebungskonfiguration gefunden. Nutze manuelles Projekt.");
-    firebaseConfig = manualConfig;
-    isManualMode = true;
   }
 
   app = initializeApp(firebaseConfig);
@@ -104,8 +97,10 @@ try {
   configError = e.message;
 }
 
-// App ID Fallback (wichtig um 'appId is not defined' zu verhindern)
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'knobelkasse-manual';
+// WICHTIG: Einheitliche App ID Logik
+// Wenn keine App-ID vom System kommt, nutzen wir eine feste "Default-Lobby",
+// damit alle "Fallback"-Nutzer zumindest im selben Raum landen.
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'knobelkasse-default-lobby';
 
 // ==========================================
 // 2. HEADER GRAFIK
@@ -173,7 +168,6 @@ function KnobelKasse() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isDemo, setIsDemo] = useState(false);
   const [connectionError, setConnectionError] = useState(null); 
-  const [authErrorType, setAuthErrorType] = useState(null);
   
   // Admin State
   const [isAdmin, setIsAdmin] = useState(false);
@@ -200,20 +194,8 @@ function KnobelKasse() {
         }
       } catch (err) {
         console.error("Auth Fehler:", err);
-        
-        let msg = err.message;
-        let type = 'other';
-        
-        if (err.code === 'auth/operation-not-allowed') {
-            msg = "Anonyme Anmeldung deaktiviert! (Firebase Console)";
-            type = 'auth-disabled';
-        } else if (err.code === 'auth/network-request-failed') {
-            msg = "Keine Verbindung zum Server.";
-            type = 'network';
-        }
-
-        setConnectionError(msg);
-        setAuthErrorType(type);
+        setConnectionError(err.message);
+        // Wir gehen erst in den Demo-Modus, wenn Auth komplett fehlschlägt
         setIsDemo(true); 
       }
     };
@@ -223,48 +205,29 @@ function KnobelKasse() {
         if (u) {
             setUser(u);
             setConnectionError(null);
-            setAuthErrorType(null);
-            setIsDemo(false);
+            setIsDemo(false); // Versuche Online zu gehen
         }
     });
   }, []);
 
-  // 2. Data Loading (Online & Offline/Demo)
+  // 2. Data Loading
   useEffect(() => {
-    if (!user && !isDemo) return;
+    // Wenn kein User, warte. Wenn Offline-Modus erzwungen (Demo), lade Lokal.
+    if ((!user && !isDemo) || !db) return;
 
-    // --- OFFLINE / LOKALER SPEICHER LOGIK ---
     if (isDemo) {
-      const loadLocal = (key, def) => {
-          try {
-              const item = localStorage.getItem(`knobel_${key}`);
-              return item ? JSON.parse(item) : def;
-          } catch(e) { return def; }
-      };
-
-      setMembers(loadLocal('members', [{ id: '1', name: 'Beispiel Bernd', debt: 0 }]));
-      setCatalog(loadLocal('catalog', [{ id: 'c1', title: 'Zu spät', amount: 2.00, count: 0 }]));
-      setEvents(loadLocal('events', []));
-      setHistory(loadLocal('history', []));
-      setPot(loadLocal('pot', { balance: 0 }));
-      return;
+        loadLocalData();
+        return;
     }
 
-    // --- ONLINE FIREBASE LOGIK ---
-    if (!db) return;
-
-    // HELPER: Intelligente Pfadwahl
-    const getSafeCol = (colName) => {
-        if (isManualMode) {
-            return collection(db, colName); // Manuell: Direkt in Root
-        }
-        return collection(db, 'artifacts', appId, 'public', 'data', colName); // Auto: Artifacts Path
-    }
+    // --- ONLINE LOGIK (IMMER ARTIFACTS PFAD) ---
+    // Wir nutzen jetzt IMMER den langen Pfad, egal welche Config.
+    // Das stellt sicher, dass wir nicht in gesperrte Root-Verzeichnisse schreiben.
+    
+    const getPath = (col) => collection(db, 'artifacts', appId, 'public', 'data', col);
 
     const safeSnapshot = (colName, setter) => {
-      const colRef = getSafeCol(colName);
-      
-      return onSnapshot(colRef, (snap) => {
+      return onSnapshot(getPath(colName), (snap) => {
           const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
           
           if (colName === 'knobel_members') data.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
@@ -282,11 +245,11 @@ function KnobelKasse() {
         },
         (err) => {
             console.error(`Ladefehler ${colName}:`, err);
-            setConnectionError(`DB Fehler: ${err.message}`);
-            // Fallback auf Local Mode bei Permission Errors
+            // Nur wenn wirklich Permission denied auf dem korrekten Pfad kommt, gehen wir offline
             if (err.code === 'permission-denied') {
-                setAuthErrorType('rules');
+                console.warn("Kein Zugriff auf DB -> Wechsel zu Offline Modus");
                 setIsDemo(true);
+                setConnectionError("Keine Schreibrechte (Offline)");
             }
         }
       );
@@ -299,53 +262,41 @@ function KnobelKasse() {
     const unsubPot = safeSnapshot('knobel_pot', setPot);
 
     return () => {
-      if (unsubMembers) unsubMembers();
-      if (unsubCatalog) unsubCatalog();
-      if (unsubEvents) unsubEvents();
-      if (unsubHistory) unsubHistory();
-      if (unsubPot) unsubPot();
+      unsubMembers && unsubMembers();
+      unsubCatalog && unsubCatalog();
+      unsubEvents && unsubEvents();
+      unsubHistory && unsubHistory();
+      unsubPot && unsubPot();
     };
   }, [user, isDemo]);
 
-  // Helper für Aktionen (Passend zum Lade-Pfad)
-  const getCol = (name) => {
-      if (isManualMode) return collection(db, name);
-      return collection(db, 'artifacts', appId, 'public', 'data', name);
-  }
-  const getDocRef = (name, id) => {
-      if (isManualMode) return doc(db, name, id);
-      return doc(db, 'artifacts', appId, 'public', 'data', name, id);
-  }
-
-  // --- LOCAL STORAGE HELPER ---
-  const saveLocal = (key, data) => {
-      try { localStorage.setItem(`knobel_${key}`, JSON.stringify(data)); }
-      catch(e) { console.error("Local Save Error", e); }
+  // LOCAL STORAGE LOADER
+  const loadLocalData = () => {
+      const load = (key, def) => {
+          try { return JSON.parse(localStorage.getItem(`knobel_${key}`)) || def; } 
+          catch(e) { return def; }
+      };
+      setMembers(load('members', []));
+      setCatalog(load('catalog', [{id:'demo', title:'Offline-Beispiel', amount: 5}]));
+      setEvents(load('events', []));
+      setHistory(load('history', []));
+      setPot(load('pot', { balance: 0 }));
   };
 
   // --- ACTIONS (UNIFIED) ---
+  // Helper für korrekte Pfade (immer Artifacts!)
+  const getCol = (name) => collection(db, 'artifacts', appId, 'public', 'data', name);
+  const getDocRef = (name, id) => doc(db, 'artifacts', appId, 'public', 'data', name, id);
+  const saveLocal = (key, data) => localStorage.setItem(`knobel_${key}`, JSON.stringify(data));
 
   const bookPenalty = async (memberId, memberName, penaltyTitle, amount, catalogId) => {
-    // OFFLINE
     if (isDemo) {
         const newMembers = members.map(m => m.id === memberId ? { ...m, debt: (m.debt || 0) + amount } : m);
         const newHistory = [{ id: Date.now().toString(), text: `${memberName}: ${penaltyTitle}`, amount, type: 'penalty', createdAt: { seconds: Date.now()/1000 } }, ...history];
-        
-        let newCatalog = catalog;
-        if (catalogId) {
-            newCatalog = catalog.map(c => c.id === catalogId ? { ...c, count: (c.count || 0) + 1 } : c);
-            setCatalog(newCatalog);
-            saveLocal('catalog', newCatalog);
-        }
-
-        setMembers(newMembers);
-        setHistory(newHistory);
-        saveLocal('members', newMembers);
-        saveLocal('history', newHistory);
+        setMembers(newMembers); setHistory(newHistory);
+        saveLocal('members', newMembers); saveLocal('history', newHistory);
         return;
     }
-
-    // ONLINE
     try {
       await updateDoc(getDocRef('knobel_members', memberId), { debt: increment(amount) });
       if (catalogId) await updateDoc(getDocRef('knobel_catalog', catalogId), { count: increment(1) });
@@ -354,22 +305,14 @@ function KnobelKasse() {
   };
 
   const payDebt = async (memberId, memberName, amount) => {
-    // OFFLINE
     if (isDemo) {
         const newMembers = members.map(m => m.id === memberId ? { ...m, debt: (m.debt || 0) - amount } : m);
         const newHistory = [{ id: Date.now().toString(), text: `${memberName} hat eingezahlt`, amount: -amount, type: 'payment', createdAt: { seconds: Date.now()/1000 } }, ...history];
         const newPot = { balance: (pot.balance || 0) + amount };
-
-        setMembers(newMembers);
-        setHistory(newHistory);
-        setPot(newPot);
-        saveLocal('members', newMembers);
-        saveLocal('history', newHistory);
-        saveLocal('pot', newPot);
+        setMembers(newMembers); setHistory(newHistory); setPot(newPot);
+        saveLocal('members', newMembers); saveLocal('history', newHistory); saveLocal('pot', newPot);
         return;
     }
-
-    // ONLINE
     try {
       await updateDoc(getDocRef('knobel_members', memberId), { debt: increment(-amount) });
       await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(amount) }, { merge: true });
@@ -378,45 +321,35 @@ function KnobelKasse() {
   };
 
   const bookExpense = async (title, amount) => {
-      // OFFLINE
       if (isDemo) {
           const newPot = { balance: (pot.balance || 0) - amount };
           const newHistory = [{ id: Date.now().toString(), text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: { seconds: Date.now()/1000 } }, ...history];
-          setPot(newPot);
-          setHistory(newHistory);
-          saveLocal('pot', newPot);
-          saveLocal('history', newHistory);
+          setPot(newPot); setHistory(newHistory);
+          saveLocal('pot', newPot); saveLocal('history', newHistory);
           return;
       }
-
-      // ONLINE
       try {
         await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(-amount) }, { merge: true });
         await addDoc(getCol('knobel_history'), { text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: serverTimestamp() });
       } catch (e) { console.error(e); }
   }
 
-  // UNIFIED CRUD HANDLERS
   const handleAddMember = async (name) => {
       if (isDemo) {
           const newItem = { id: Date.now().toString(), name, debt: 0 };
           const newMembers = [...members, newItem];
-          setMembers(newMembers);
-          saveLocal('members', newMembers);
+          setMembers(newMembers); saveLocal('members', newMembers);
       } else {
-          const col = isManualMode ? collection(db, 'knobel_members') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_members');
-          await addDoc(col, { name, debt: 0, createdAt: serverTimestamp() });
+          await addDoc(getCol('knobel_members'), { name, debt: 0, createdAt: serverTimestamp() });
       }
   };
 
   const handleDeleteMember = async (id) => {
       if (isDemo) {
           const newMembers = members.filter(m => m.id !== id);
-          setMembers(newMembers);
-          saveLocal('members', newMembers);
+          setMembers(newMembers); saveLocal('members', newMembers);
       } else {
-          const docRef = isManualMode ? doc(db, 'knobel_members', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_members', id);
-          await deleteDoc(docRef);
+          await deleteDoc(getDocRef('knobel_members', id));
       }
   };
 
@@ -424,22 +357,18 @@ function KnobelKasse() {
       if (isDemo) {
           const newItem = { id: Date.now().toString(), title, amount, count: 0 };
           const newCatalog = [...catalog, newItem];
-          setCatalog(newCatalog);
-          saveLocal('catalog', newCatalog);
+          setCatalog(newCatalog); saveLocal('catalog', newCatalog);
       } else {
-          const col = isManualMode ? collection(db, 'knobel_catalog') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog');
-          await addDoc(col, { title, amount, createdAt: serverTimestamp(), count: 0 });
+          await addDoc(getCol('knobel_catalog'), { title, amount, createdAt: serverTimestamp(), count: 0 });
       }
   };
 
   const handleDeleteCatalog = async (id) => {
       if (isDemo) {
           const newCatalog = catalog.filter(c => c.id !== id);
-          setCatalog(newCatalog);
-          saveLocal('catalog', newCatalog);
+          setCatalog(newCatalog); saveLocal('catalog', newCatalog);
       } else {
-          const docRef = isManualMode ? doc(db, 'knobel_catalog', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog', id);
-          await deleteDoc(docRef);
+          await deleteDoc(getDocRef('knobel_catalog', id));
       }
   };
 
@@ -447,22 +376,18 @@ function KnobelKasse() {
       if (isDemo) {
           const newItem = { id: Date.now().toString(), date, time, location };
           const newEvents = [...events, newItem];
-          setEvents(newEvents);
-          saveLocal('events', newEvents);
+          setEvents(newEvents); saveLocal('events', newEvents);
       } else {
-          const col = isManualMode ? collection(db, 'knobel_events') : collection(db, 'artifacts', appId, 'public', 'data', 'knobel_events');
-          await addDoc(col, { date, time, location, createdAt: serverTimestamp() });
+          await addDoc(getCol('knobel_events'), { date, time, location, createdAt: serverTimestamp() });
       }
   };
 
   const handleDeleteEvent = async (id) => {
       if (isDemo) {
           const newEvents = events.filter(e => e.id !== id);
-          setEvents(newEvents);
-          saveLocal('events', newEvents);
+          setEvents(newEvents); saveLocal('events', newEvents);
       } else {
-          const docRef = isManualMode ? doc(db, 'knobel_events', id) : doc(db, 'artifacts', appId, 'public', 'data', 'knobel_events', id);
-          await deleteDoc(docRef);
+          await deleteDoc(getDocRef('knobel_events', id));
       }
   };
 
@@ -476,7 +401,7 @@ function KnobelKasse() {
   };
 
   const clearLocalData = () => {
-      if (confirm("Wirklich alle lokalen Daten löschen?")) {
+      if (confirm("Lokal gespeicherte Daten löschen?")) {
           localStorage.removeItem('knobel_members');
           localStorage.removeItem('knobel_catalog');
           localStorage.removeItem('knobel_events');
@@ -489,11 +414,10 @@ function KnobelKasse() {
   // Views
   const totalDebt = members.reduce((acc, m) => acc + (m.debt || 0), 0);
 
-  if (!user && !connectionError && !isDemo) return (
+  if (!user && !isDemo) return (
     <div className="flex flex-col h-screen items-center justify-center bg-slate-900 text-white p-6 text-center">
         <Loader2 className="w-12 h-12 animate-spin text-amber-500 mb-4" />
-        <p className="animate-pulse mb-2 text-lg font-bold">Lade Datenbank...</p>
-        <p className="text-sm text-slate-400">Modus: {isManualMode ? 'Dediziert' : 'Automatisch'}</p>
+        <p className="animate-pulse mb-2 text-lg font-bold">Verbinde mit Server...</p>
     </div>
   );
 
@@ -503,7 +427,15 @@ function KnobelKasse() {
         <div className="max-w-4xl mx-auto flex justify-between items-center px-2">
           <div className="flex items-center gap-2">
             <HeaderGraphic />
-            {isDemo && <span className="bg-amber-600 text-white text-[10px] px-2 py-0.5 rounded-md font-bold uppercase self-start mt-1">Offline</span>}
+            {isDemo ? (
+                 <span className="bg-red-600 text-white text-[10px] px-2 py-0.5 rounded-md font-bold uppercase self-start mt-1 flex items-center gap-1">
+                    <WifiOff className="w-3 h-3" /> Offline
+                 </span>
+            ) : (
+                 <span className="bg-green-600 text-white text-[10px] px-2 py-0.5 rounded-md font-bold uppercase self-start mt-1 flex items-center gap-1 animate-pulse">
+                    <Wifi className="w-3 h-3" /> Live
+                 </span>
+            )}
           </div>
           <button 
             onClick={() => isAdmin ? setIsAdmin(false) : setShowAdminLogin(true)} 
@@ -514,35 +446,11 @@ function KnobelKasse() {
         </div>
       </header>
 
-      {/* KRITISCHE FEHLERMELDUNGEN */}
-      {authErrorType === 'auth-disabled' && (
-          <div className="bg-red-600 text-white px-4 py-3 text-center text-sm font-bold shadow-md animate-in slide-in-from-top-2 z-50 flex flex-col gap-1">
-              <div className="flex items-center justify-center gap-2">
-                <AlertCircle className="w-5 h-5 shrink-0" />
-                <span>Speichern blockiert!</span>
-              </div>
-              <div className="text-xs font-normal opacity-90">
-                  Bitte in Firebase Console {'>'} Authentication {'>'} Sign-in method {'>'} <b>Anonymous</b> aktivieren.
-              </div>
-          </div>
-      )}
-
-      {authErrorType === 'rules' && (
-          <div className="bg-orange-500 text-white px-4 py-3 text-center text-sm font-bold shadow-md animate-in slide-in-from-top-2 z-50">
-              <div className="flex items-center justify-center gap-2">
-                <ShieldCheck className="w-5 h-5 shrink-0" />
-                <span>Keine Schreibrechte</span>
-              </div>
-              <div className="text-xs font-normal mt-1 opacity-90">
-                  Wechsle auf lokalen Speicher...
-              </div>
-          </div>
-      )}
-      
-      {!authErrorType && isDemo && !connectionError && (
-          <div className="bg-amber-500 text-white px-4 py-2 text-center text-xs font-bold shadow-md flex justify-between items-center">
-              <span>OFFLINE / LOKAL</span>
-              {isAdmin && <button onClick={clearLocalData} className="underline opacity-80 hover:opacity-100">Reset?</button>}
+      {/* OFFLINE WARNING */}
+      {isDemo && (
+          <div className="bg-red-500 text-white px-4 py-2 text-center text-xs font-bold shadow-md flex justify-between items-center z-50">
+              <span className="flex items-center gap-1"><Info className="w-4 h-4"/> Daten werden nur AUF DIESEM GERÄT gespeichert.</span>
+              {isAdmin && <button onClick={clearLocalData} className="underline opacity-80 hover:opacity-100 ml-2">Reset</button>}
           </div>
       )}
 
@@ -557,11 +465,10 @@ function KnobelKasse() {
         </div>
       </main>
 
-      {/* FOOTER DEBUG */}
-      <div className="bg-slate-100 p-2 text-[10px] text-slate-400 text-center border-t border-slate-200">
-          DB: {isManualMode ? 'Manuell' : 'Auto'} • 
-          Status: {isDemo ? 'Lokal (Gespeichert)' : 'Online (Firebase)'} •
-          {authErrorType ? ' FEHLER!' : ' Bereit'}
+      {/* FOOTER DEBUG - VITAL FOR SYNC CHECKING */}
+      <div className="bg-slate-100 p-2 text-[10px] text-slate-400 text-center border-t border-slate-200 flex flex-col gap-0.5">
+          <div className="font-mono">Room-ID: {appId.slice(0, 15)}...</div>
+          <div>Status: {isDemo ? 'Lokal (Kein Sync)' : 'Verbunden (Sync Aktiv)'}</div>
       </div>
 
       <nav className="bg-white border-t border-slate-200 absolute bottom-0 w-full z-20 pb-6 pt-2">
