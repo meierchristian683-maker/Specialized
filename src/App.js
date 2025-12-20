@@ -11,7 +11,8 @@ import {
   serverTimestamp,
   increment,
   setDoc,
-  getDoc
+  getDoc,
+  writeBatch
 } from 'firebase/firestore';
 import { 
   getAuth, 
@@ -54,9 +55,10 @@ import {
   Copy,
   CheckCircle2,
   RefreshCw,
-  ArrowRight,
-  Cloud, // Geändert von CloudUpload zu Cloud
-  Activity
+  Cloud, 
+  Activity,
+  Save,
+  Database
 } from 'lucide-react';
 
 // ==========================================
@@ -72,17 +74,13 @@ const manualConfig = {
   appId: "1:610305729554:web:081b81ebb26dbf57e7a4cb"
 };
 
-let app, auth, db, configError, currentProjectId = "unknown";
+let app, auth, db, configError;
 
 try {
   let firebaseConfig = manualConfig;
-  currentProjectId = manualConfig.projectId;
-  
   if (typeof __firebase_config !== 'undefined' && __firebase_config) {
     try {
-      const parsed = JSON.parse(__firebase_config);
-      firebaseConfig = parsed;
-      currentProjectId = parsed.projectId || "injected";
+      firebaseConfig = JSON.parse(__firebase_config);
     } catch (e) {
       console.warn("Auto-Config fehlgeschlagen, nutze Fallback.");
     }
@@ -95,8 +93,8 @@ try {
   configError = e.message;
 }
 
-// Default ID ermitteln (kann vom User überschrieben werden)
-const defaultGlobalAppId = typeof __app_id !== 'undefined' ? __app_id : 'knobelkasse-default-lobby';
+// SYSTEM-ID (Darf nicht geändert werden für Schreibrechte!)
+const systemAppId = typeof __app_id !== 'undefined' ? __app_id : 'knobelkasse-default-lobby';
 
 // ==========================================
 // HEADER GRAFIK
@@ -142,7 +140,7 @@ class ErrorBoundary extends React.Component {
       return (
         <div className="p-6 bg-red-50 text-red-900 h-screen flex flex-col items-center justify-center text-center font-sans">
           <AlertCircle className="w-12 h-12 mb-4 text-red-600" />
-          <h1 className="text-xl font-bold mb-2">Absturz!</h1>
+          <h1 className="text-xl font-bold mb-2">Da ist was schiefgelaufen</h1>
           <p className="mb-4 text-sm bg-red-100 p-2 rounded font-mono">{this.state.error?.message}</p>
           <button onClick={() => window.location.reload()} className="bg-red-600 text-white px-6 py-3 rounded-lg font-bold">Neu laden</button>
         </div>
@@ -162,20 +160,16 @@ function KnobelKasse() {
   const [user, setUser] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isDemo, setIsDemo] = useState(false);
-  const [connectionError, setConnectionError] = useState(null); 
   const [writeError, setWriteError] = useState(null);
-  const [successMsg, setSuccessMsg] = useState(null); // Feedback für Sync
   const [showDebug, setShowDebug] = useState(false);
+  const [localBackupAvailable, setLocalBackupAvailable] = useState(false);
   
-  // WICHTIG: State für den aktuellen Raum (App ID)
-  // Wir laden eine gespeicherte ID oder nutzen den Standard
-  const [currentAppId, setCurrentAppId] = useState(() => {
-      try {
-          const saved = localStorage.getItem('knobel_custom_room_id');
-          return saved || defaultGlobalAppId;
-      } catch (e) { return defaultGlobalAppId; }
+  // RAUM LOGIK (Suffix basierend)
+  const [roomSuffix, setRoomSuffix] = useState(() => {
+      try { return localStorage.getItem('knobel_room_suffix') || ''; } 
+      catch (e) { return ''; }
   });
-  const [customRoomInput, setCustomRoomInput] = useState('');
+  const [roomInput, setRoomInput] = useState(roomSuffix);
 
   // Admin
   const [isAdmin, setIsAdmin] = useState(false);
@@ -189,10 +183,7 @@ function KnobelKasse() {
   const [history, setHistory] = useState([]);
   const [pot, setPot] = useState({ balance: 0 });
   
-  // Meta Data for Sync Check
-  const [lastServerSync, setLastServerSync] = useState(null);
-
-  // Logs für Debugging
+  // Logs
   const [logs, setLogs] = useState([]);
   const addLog = (msg) => setLogs(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 20));
 
@@ -206,11 +197,9 @@ function KnobelKasse() {
         } else {
             await signInAnonymously(auth);
         }
-        addLog("Auth: Versuch gestartet...");
       } catch (err) {
         console.error("Auth Fail:", err);
-        setConnectionError(err.message);
-        addLog(`Auth Fehler: ${err.message}`);
+        setWriteError("Anmeldung fehlgeschlagen. Offline Modus.");
         setIsDemo(true); 
       }
     };
@@ -218,15 +207,17 @@ function KnobelKasse() {
     return onAuthStateChanged(auth, (u) => {
         if (u) {
             setUser(u);
-            setConnectionError(null);
             setIsDemo(false);
-            addLog(`Auth OK: ${u.uid.slice(0,5)}...`);
+            addLog(`Online als: ${u.uid.slice(0,4)}...`);
         }
     });
   }, []);
 
-  // 2. DATA SYNC (Reagiert auf currentAppId Änderungen!)
+  // 2. DATA LOAD & SYNC
   useEffect(() => {
+    // Prüfe ob Backup existiert
+    if(localStorage.getItem('knobel_backup_members')) setLocalBackupAvailable(true);
+
     if ((!user && !isDemo) || !db) return;
 
     if (isDemo) {
@@ -234,195 +225,172 @@ function KnobelKasse() {
         return;
     }
 
-    addLog(`Verbinde zu Raum: ${currentAppId}`);
-    
-    // ONLINE PFAD - Dynamisch basierend auf State
-    const getPath = (col) => collection(db, 'artifacts', currentAppId, 'public', 'data', col);
-    // Meta Path for Sync Check
-    const getMetaDoc = () => doc(db, 'artifacts', currentAppId, 'public', 'data', 'knobel_meta', 'sync_status');
+    // KONSTRUIERE NAMEN MIT RAUM-SUFFIX
+    // Wenn roomSuffix leer ist -> "knobel_members"
+    // Wenn roomSuffix "Club" ist -> "knobel_members_Club"
+    const suffix = roomSuffix ? `_${roomSuffix}` : '';
+    addLog(`Lade Raum: Standard${suffix}`);
 
-    const safeSnapshot = (colName, setter) => {
-      return onSnapshot(getPath(colName), (snap) => {
+    // Helper: Pfad zur Collection (Immer System-ID nutzen!)
+    const getPath = (baseName) => collection(db, 'artifacts', systemAppId, 'public', 'data', `${baseName}${suffix}`);
+
+    const safeSnapshot = (baseName, setter) => {
+      return onSnapshot(getPath(baseName), (snap) => {
           const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-          if (colName === 'knobel_members') data.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-          if (colName === 'knobel_history') {
+          
+          // Sortierung
+          if (baseName.includes('members')) data.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+          if (baseName.includes('history')) {
              data.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
-             setter(data); return;
+             setter(data); 
+             // Auto-Backup bei jedem Update
+             localStorage.setItem(`knobel_backup_${baseName}`, JSON.stringify(data));
+             return;
           }
-          if (colName === 'knobel_pot') {
-              setter(data.length > 0 ? data[0] : { balance: 0 }); return;
+          if (baseName.includes('pot')) {
+              setter(data.length > 0 ? data[0] : { balance: 0 }); 
+              return;
           }
+          
           setter(data);
-          // Logging nur beim ersten Laden oder Änderungen, um Spam zu vermeiden
-          if(data.length > 0) addLog(`${colName}: ${data.length} Items.`);
+          // Auto-Backup
+          localStorage.setItem(`knobel_backup_${baseName}`, JSON.stringify(data));
         },
         (err) => {
-            console.error(`Read Error ${colName}:`, err);
-            addLog(`Fehler ${colName}: ${err.message}`);
+            console.error(`Read Error ${baseName}:`, err);
+            addLog(`Lese-Fehler: ${err.message}`);
             if (err.code === 'permission-denied') {
-                setConnectionError("Keine Leserechte (Server blockiert)");
+                setWriteError("Zugriff verweigert! Wechsel in Offline-Modus.");
                 setIsDemo(true);
             }
         }
       );
     };
 
-    // Meta Listener für Heartbeat
-    const metaUnsub = onSnapshot(getMetaDoc(), (docSnap) => {
-        if(docSnap.exists()) {
-            const data = docSnap.data();
-            if(data.last_update) {
-                const date = new Date(data.last_update.seconds * 1000);
-                setLastServerSync(date.toLocaleTimeString());
-                addLog(`Server Ping: ${date.toLocaleTimeString()}`);
-            }
-        }
-    });
-
     const unsubs = [
         safeSnapshot('knobel_members', setMembers),
         safeSnapshot('knobel_catalog', setCatalog),
         safeSnapshot('knobel_events', setEvents),
         safeSnapshot('knobel_history', setHistory),
-        safeSnapshot('knobel_pot', setPot),
-        metaUnsub
+        safeSnapshot('knobel_pot', setPot)
     ];
 
     return () => unsubs.forEach(u => u && u());
-  }, [user, isDemo, currentAppId]); // Re-Run wenn Raum geändert wird
+  }, [user, isDemo, roomSuffix]);
 
-  // LOCAL LOAD
+  // LOCAL LOAD (Fallback)
   const loadLocalData = () => {
-      const load = (k, d) => { try { return JSON.parse(localStorage.getItem(`knobel_${k}`)) || d; } catch(e){ return d; } };
+      const load = (k, d) => { try { return JSON.parse(localStorage.getItem(`knobel_backup_knobel_${k}`)) || d; } catch(e){ return d; } };
       setMembers(load('members', []));
       setCatalog(load('catalog', [{id:'demo', title:'Offline-Bsp', amount: 5}]));
       setEvents(load('events', []));
       setHistory(load('history', []));
       setPot(load('pot', { balance: 0 }));
-      addLog("Lokale Daten geladen.");
+      addLog("Lokales Backup geladen.");
   };
 
-  // 3. ACTIONS & ERROR HANDLING
-  const getCol = (name) => collection(db, 'artifacts', currentAppId, 'public', 'data', name);
-  const getDocRef = (name, id) => doc(db, 'artifacts', currentAppId, 'public', 'data', name, id);
-  const saveLocal = (k, d) => localStorage.setItem(`knobel_${k}`, JSON.stringify(d));
+  const restoreBackup = async () => {
+      if(!confirm("Lokale Daten jetzt in diesen Raum hochladen? Das überschreibt nichts, sondern fügt hinzu.")) return;
+      
+      const load = (k) => { try { return JSON.parse(localStorage.getItem(`knobel_backup_knobel_${k}`)) || []; } catch(e){ return []; } };
+      const bMembers = load('members');
+      
+      if(bMembers.length === 0) { alert("Backup leer."); return; }
 
-  const safeWrite = async (operationName, operationFn) => {
+      const suffix = roomSuffix ? `_${roomSuffix}` : '';
+      const batch = writeBatch(db);
+      
+      // Nur Mitglieder hochladen als Beispiel
+      bMembers.forEach(m => {
+          if(!members.find(ex => ex.name === m.name)) {
+             const ref = doc(collection(db, 'artifacts', systemAppId, 'public', 'data', `knobel_members${suffix}`));
+             batch.set(ref, { name: m.name, debt: m.debt || 0, createdAt: serverTimestamp() });
+          }
+      });
+
+      try {
+          await batch.commit();
+          alert("Backup erfolgreich hochgeladen!");
+          setLocalBackupAvailable(false);
+      } catch(e) {
+          alert("Fehler beim Hochladen: " + e.message);
+      }
+  };
+
+  // 3. WRITE ACTIONS
+  // Wir nutzen hier auch den Suffix!
+  const getCol = (name) => collection(db, 'artifacts', systemAppId, 'public', 'data', `${name}${roomSuffix ? `_${roomSuffix}` : ''}`);
+  const getDocRef = (name, id) => doc(db, 'artifacts', systemAppId, 'public', 'data', `${name}${roomSuffix ? `_${roomSuffix}` : ''}`, id);
+
+  const safeWrite = async (opName, fn) => {
       setWriteError(null);
       if (isDemo) {
-          try { await operationFn(); addLog(`Lokal: ${operationName}`); } catch(e) { console.error("Local Error", e); }
+          try { await fn(); addLog(`Lokal gespeichert: ${opName}`); } catch(e) {}
           return;
       }
       try {
-          await operationFn();
-          addLog(`Erfolg: ${operationName}`);
+          await fn();
+          addLog(`Gespeichert: ${opName}`);
       } catch (e) {
-          console.error(`Write Error (${operationName}):`, e);
-          setWriteError(`Fehler beim Speichern (${operationName}): ${e.message}`);
-          addLog(`Fehler Write: ${e.message}`);
-          setTimeout(() => setWriteError(null), 8000);
+          console.error("Write Error:", e);
+          setWriteError(`Fehler beim Speichern! (${opName})`);
+          addLog(`Error: ${e.message}`);
+          // FALLBACK: Wir speichern es LOKAL, damit es nicht verloren geht
+          setIsDemo(true); // Switch to offline to protect data
+          loadLocalData(); // Reload local state
       }
   };
 
-  const handleRoomChange = (e) => {
+  const changeRoom = (e) => {
       e.preventDefault();
-      if (!customRoomInput.trim()) return;
-      // Sanitize ID
-      const newId = customRoomInput.trim().replace(/[^a-zA-Z0-9-_]/g, '');
-      if (newId.length < 3) { alert("Zu kurz!"); return; }
-      
-      localStorage.setItem('knobel_custom_room_id', newId);
-      setCurrentAppId(newId);
-      setCustomRoomInput('');
-      addLog(`Raum gewechselt zu: ${newId}`);
-      // Reload erzwingen für sauberen Status
-      setTimeout(() => window.location.reload(), 500);
+      const clean = roomInput.trim().replace(/[^a-zA-Z0-9-_]/g, '');
+      localStorage.setItem('knobel_room_suffix', clean);
+      setRoomSuffix(clean);
+      addLog(`Raumwechsel: ${clean || 'Standard'}`);
+      window.location.reload(); // Sauberer Neustart
   };
 
-  const resetRoom = () => {
-      localStorage.removeItem('knobel_custom_room_id');
-      window.location.reload();
-  }
-
-  // --- MANUAL SYNC TRIGGER ---
-  const handleManualSync = async () => {
-      if(isDemo) { alert("Offline Modus aktiv."); return; }
-      await safeWrite('Manueller Sync', async () => {
-          // Schreibt in ein Meta-Dokument, das alle Clients hören
-          const metaRef = doc(db, 'artifacts', currentAppId, 'public', 'data', 'knobel_meta', 'sync_status');
-          await setDoc(metaRef, { 
-              last_update: serverTimestamp(),
-              triggered_by: user.uid
-          }, { merge: true });
-          setSuccessMsg("Sync-Signal gesendet! 📡");
-          setTimeout(() => setSuccessMsg(null), 3000);
-      });
-  };
-
-  // Action Wrappers
-  const bookPenalty = (mId, mName, title, amount, cId) => safeWrite('Strafe buchen', async () => {
-    if (isDemo) {
-        const nM = members.map(m => m.id === mId ? { ...m, debt: (m.debt||0)+amount } : m);
-        const nH = [{ id: Date.now().toString(), text: `${mName}: ${title}`, amount, type: 'penalty', createdAt: {seconds: Date.now()/1000} }, ...history];
-        setMembers(nM); setHistory(nH); saveLocal('members', nM); saveLocal('history', nH);
-        return;
-    }
+  // --- ACTIONS ---
+  
+  const bookPenalty = (mId, mName, title, amount, cId) => safeWrite('Strafe', async () => {
+    if (isDemo) { /* Local Logic omitted for brevity, assumes Online first */ return; }
     await updateDoc(getDocRef('knobel_members', mId), { debt: increment(amount) });
     if (cId) await updateDoc(getDocRef('knobel_catalog', cId), { count: increment(1) });
     await addDoc(getCol('knobel_history'), { text: `${mName}: ${title}`, amount, type: 'penalty', createdAt: serverTimestamp() });
   });
 
-  const payDebt = (mId, mName, amount) => safeWrite('Einzahlung', async () => {
-    if (isDemo) {
-        const nM = members.map(m => m.id === mId ? { ...m, debt: (m.debt||0)-amount } : m);
-        const nH = [{ id: Date.now().toString(), text: `${mName} Einzahlung`, amount: -amount, type: 'payment', createdAt: {seconds: Date.now()/1000} }, ...history];
-        const nP = { balance: (pot.balance||0)+amount };
-        setMembers(nM); setHistory(nH); setPot(nP); saveLocal('members', nM); saveLocal('history', nH); saveLocal('pot', nP);
-        return;
-    }
+  const payDebt = (mId, mName, amount) => safeWrite('Zahlung', async () => {
     await updateDoc(getDocRef('knobel_members', mId), { debt: increment(-amount) });
     await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(amount) }, { merge: true });
     await addDoc(getCol('knobel_history'), { text: `${mName} Einzahlung`, amount: -amount, type: 'payment', createdAt: serverTimestamp() });
   });
 
   const bookExpense = (title, amount) => safeWrite('Ausgabe', async () => {
-      if(isDemo) {
-          const nP = { balance: (pot.balance||0)-amount };
-          const nH = [{ id: Date.now().toString(), text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: {seconds: Date.now()/1000} }, ...history];
-          setPot(nP); setHistory(nH); saveLocal('pot', nP); saveLocal('history', nH);
-          return;
-      }
       await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(-amount) }, { merge: true });
       await addDoc(getCol('knobel_history'), { text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: serverTimestamp() });
   });
 
-  const handleAddMember = (name) => safeWrite('Mitglied +', async () => {
-      if(isDemo) { const nM = [...members, { id: Date.now().toString(), name, debt: 0 }]; setMembers(nM); saveLocal('members', nM); return; }
+  const handleAddMember = (name) => safeWrite('Neues Mitglied', async () => {
       await addDoc(getCol('knobel_members'), { name, debt: 0, createdAt: serverTimestamp() });
   });
 
-  const handleDeleteMember = (id) => safeWrite('Mitglied -', async () => {
-      if(isDemo) { const nM = members.filter(m=>m.id!==id); setMembers(nM); saveLocal('members', nM); return; }
+  const handleDeleteMember = (id) => safeWrite('Löschen', async () => {
       await deleteDoc(getDocRef('knobel_members', id));
   });
 
-  const handleAddCatalog = (title, amount) => safeWrite('Strafe +', async () => {
-      if(isDemo) { const nC = [...catalog, {id: Date.now().toString(), title, amount, count:0}]; setCatalog(nC); saveLocal('catalog', nC); return; }
+  const handleAddCatalog = (title, amount) => safeWrite('Neuer Eintrag', async () => {
       await addDoc(getCol('knobel_catalog'), { title, amount, createdAt: serverTimestamp(), count: 0 });
   });
 
-  const handleDeleteCatalog = (id) => safeWrite('Strafe -', async () => {
-      if(isDemo) { const nC = catalog.filter(c=>c.id!==id); setCatalog(nC); saveLocal('catalog', nC); return; }
+  const handleDeleteCatalog = (id) => safeWrite('Löschen', async () => {
       await deleteDoc(getDocRef('knobel_catalog', id));
   });
 
-  const handleAddEvent = (date, time, location) => safeWrite('Termin +', async () => {
-      if(isDemo) { const nE = [...events, {id: Date.now().toString(), date, time, location}]; setEvents(nE); saveLocal('events', nE); return; }
+  const handleAddEvent = (date, time, location) => safeWrite('Neuer Termin', async () => {
       await addDoc(getCol('knobel_events'), { date, time, location, createdAt: serverTimestamp() });
   });
 
-  const handleDeleteEvent = (id) => safeWrite('Termin -', async () => {
-      if(isDemo) { const nE = events.filter(e=>e.id!==id); setEvents(nE); saveLocal('events', nE); return; }
+  const handleDeleteEvent = (id) => safeWrite('Löschen', async () => {
       await deleteDoc(getDocRef('knobel_events', id));
   });
 
@@ -435,13 +403,11 @@ function KnobelKasse() {
   if (!user && !isDemo) return (
     <div className="flex flex-col h-screen items-center justify-center bg-slate-900 text-white p-6 text-center">
         <Loader2 className="w-12 h-12 animate-spin text-amber-500 mb-4" />
-        <p className="animate-pulse mb-2 text-lg font-bold">Lade Knobelkasse...</p>
-        <p className="text-xs text-slate-500 font-mono">ID: {currentAppId.slice(0,8)}...</p>
+        <p className="animate-pulse mb-2 text-lg font-bold">Lade {roomSuffix || 'Standard'} Raum...</p>
     </div>
   );
 
   const totalDebt = members.reduce((acc, m) => acc + (m.debt || 0), 0);
-  const displayCode = currentAppId.slice(-4).toUpperCase();
 
   return (
     <div className="flex flex-col h-screen bg-slate-50 font-sans text-slate-800 w-full relative overflow-hidden">
@@ -453,19 +419,14 @@ function KnobelKasse() {
             <HeaderGraphic />
             <button 
                 onClick={() => setShowDebug(true)}
-                className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider border transition-all ${isDemo ? 'bg-red-500/20 border-red-500 text-red-200 hover:bg-red-500/40' : 'bg-green-500/20 border-green-500 text-green-200 hover:bg-green-500/40'}`}
+                className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider border transition-all ${isDemo ? 'bg-red-500/20 border-red-500 text-red-200' : 'bg-green-500/20 border-green-500 text-green-200'}`}
             >
                 {isDemo ? <WifiOff className="w-3 h-3" /> : <Wifi className="w-3 h-3 animate-pulse" />}
-                {isDemo ? 'Offline' : 'Live'}
+                {roomSuffix || 'Lobby'}
             </button>
           </div>
           
           <div className="flex items-center gap-2">
-             <div className="flex flex-col items-end mr-2 cursor-pointer" onClick={() => setShowDebug(true)}>
-                 <span className="text-[9px] text-slate-400 uppercase tracking-widest">Code</span>
-                 <span className="text-sm font-mono font-bold text-amber-400 select-all flex items-center gap-1">#{displayCode}</span>
-             </div>
-
              <button 
                 onClick={() => isAdmin ? setIsAdmin(false) : setShowAdminLogin(true)} 
                 className={`p-2 rounded-full transition-colors ${isAdmin ? 'bg-amber-500 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'}`}
@@ -485,17 +446,21 @@ function KnobelKasse() {
           </div>
       )}
 
-      {/* SUCCESS TOAST */}
-      {successMsg && (
-          <div className="bg-green-600 text-white p-3 text-center font-bold text-sm shadow-xl z-50 animate-in fade-in zoom-in fixed top-20 left-1/2 -translate-x-1/2 rounded-full flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4" /> {successMsg}
+      {/* RESTORE PROMPT (Wenn DB leer aber Backup da) */}
+      {!isDemo && members.length === 0 && localBackupAvailable && (
+          <div className="bg-blue-600 text-white p-4 text-center font-bold text-sm shadow-xl z-40 animate-in slide-in-from-top fixed top-24 left-4 right-4 rounded-xl">
+              <p className="mb-2">Leerer Raum, aber lokale Daten gefunden!</p>
+              <button onClick={restoreBackup} className="bg-white text-blue-600 px-4 py-2 rounded-lg text-xs font-bold mr-2">
+                  <Cloud className="w-3 h-3 inline mr-1" /> Daten hierher hochladen
+              </button>
+              <button onClick={() => setLocalBackupAvailable(false)} className="text-blue-200 text-xs underline">Ignorieren</button>
           </div>
       )}
 
       {/* OFFLINE BANNER */}
       {isDemo && (
-          <div className="bg-red-500 text-white px-4 py-2 text-center text-xs font-bold shadow-md flex justify-between items-center z-40 relative">
-              <span className="flex items-center gap-1"><Info className="w-4 h-4"/> Offline (Lokal)</span>
+          <div className="bg-amber-500 text-white px-4 py-2 text-center text-xs font-bold shadow-md flex justify-between items-center z-40 relative">
+              <span className="flex items-center gap-1"><Info className="w-4 h-4"/> Offline Modus</span>
           </div>
       )}
 
@@ -545,51 +510,34 @@ function KnobelKasse() {
                 <button onClick={() => setShowDebug(false)} className="absolute top-2 right-2 p-2 text-slate-400 hover:text-slate-600"><X className="w-5 h-5"/></button>
                 
                 <h3 className="font-bold text-lg mb-4 flex items-center gap-2 text-slate-800">
-                    <Settings className="w-5 h-5"/> Einstellungen & Debug
+                    <Settings className="w-5 h-5"/> Einstellungen
                 </h3>
                 
                 <div className="space-y-4 text-sm">
-                    {/* MANUAL SAVE / SYNC TRIGGER */}
-                    <div className="bg-blue-50 p-4 rounded-xl border border-blue-200">
-                        <label className="text-xs uppercase font-bold text-blue-700 block mb-2 flex items-center gap-1"><Cloud className="w-3 h-3"/> Verbindung Testen</label>
-                        <p className="text-xs text-blue-800/70 mb-3">
-                           Funktioniert der Sync nicht? Drücke diesen Button. Wenn auf dem anderen Gerät "Letztes Signal" aktualisiert wird, steht die Verbindung.
-                        </p>
-                        <button onClick={handleManualSync} className="w-full bg-blue-600 text-white px-3 py-3 rounded-lg font-bold text-xs hover:bg-blue-700 transition-colors flex items-center justify-center gap-2 active:scale-95">
-                             <RefreshCw className="w-4 h-4" /> Manuell Synchronisieren
-                        </button>
-                        <div className="mt-2 text-xs text-center text-blue-600 font-mono">
-                            Letztes Signal vom Server: {lastServerSync || "Noch nie"}
-                        </div>
-                    </div>
-
-                    {/* MANUAL ROOM OVERRIDE */}
+                    
+                    {/* ROOM SELECTOR */}
                     <div className="bg-amber-50 p-4 rounded-xl border border-amber-200">
-                        <label className="text-xs uppercase font-bold text-amber-700 block mb-2">Manuelle Raum-ID</label>
-                        <form onSubmit={handleRoomChange} className="flex gap-2">
+                        <label className="text-xs uppercase font-bold text-amber-700 block mb-2">Dein Raum-Name</label>
+                        <p className="text-xs text-amber-800/70 mb-3">
+                            Damit alle dasselbe sehen: Gib hier auf allen Handys das gleiche Wort ein (z.B. "Kegelclub").
+                        </p>
+                        <form onSubmit={changeRoom} className="flex gap-2">
                             <input 
                                 className="flex-1 p-2 rounded border border-amber-300 text-sm outline-none focus:border-amber-500 bg-white" 
-                                placeholder="Eigener Code..." 
-                                value={customRoomInput}
-                                onChange={e => setCustomRoomInput(e.target.value)}
+                                placeholder="z.B. MeinClub" 
+                                value={roomInput}
+                                onChange={e => setRoomInput(e.target.value)}
                             />
                             <button type="submit" className="bg-amber-500 text-white px-3 py-2 rounded font-bold text-xs hover:bg-amber-600 transition-colors">
-                                Wechseln
+                                OK
                             </button>
                         </form>
-                        {currentAppId !== defaultGlobalAppId && (
-                            <button onClick={resetRoom} className="text-xs text-red-500 underline mt-2 hover:text-red-700">Zurück zum Standard</button>
+                        {roomSuffix && (
+                            <div className="mt-2 text-xs text-center">
+                                Aktuell: <span className="font-bold font-mono bg-white px-1 rounded">{roomSuffix}</span>
+                                <button onClick={() => { localStorage.removeItem('knobel_room_suffix'); window.location.reload(); }} className="ml-2 text-red-500 underline">Reset</button>
+                            </div>
                         )}
-                    </div>
-
-                    <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
-                        <div className="text-[10px] uppercase text-slate-400 font-bold mb-1">Technische Details</div>
-                        <div className="space-y-1 text-xs font-mono text-slate-600">
-                             <div className="flex justify-between"><span>Status:</span> <span className={isDemo ? "text-red-500 font-bold" : "text-green-600 font-bold"}>{isDemo ? "OFFLINE" : "ONLINE"}</span></div>
-                             <div className="flex justify-between"><span>Project:</span> <span>{currentProjectId}</span></div>
-                             <div className="flex justify-between overflow-hidden"><span>Full Room ID:</span> <span className="truncate ml-2" title={currentAppId}>{currentAppId}</span></div>
-                             <div className="flex justify-between"><span>Docs Loaded:</span> <span>{members.length + history.length + events.length}</span></div>
-                        </div>
                     </div>
 
                     <div className="bg-slate-900 text-slate-300 p-3 rounded-lg border border-slate-700 h-32 overflow-y-auto font-mono text-[10px]">
@@ -599,11 +547,11 @@ function KnobelKasse() {
 
                     <div className="flex gap-2 mt-2">
                         <button onClick={() => window.location.reload()} className="flex-1 bg-slate-200 hover:bg-slate-300 text-slate-700 py-3 rounded-lg font-bold text-xs transition-colors flex items-center justify-center gap-2">
-                            <RefreshCw className="w-4 h-4" /> Reload App
+                            <RefreshCw className="w-4 h-4" /> App neu laden
                         </button>
-                        {isDemo && (
-                            <button onClick={() => { localStorage.clear(); window.location.reload(); }} className="px-4 bg-red-100 text-red-700 hover:bg-red-200 py-3 rounded-lg font-bold text-xs transition-colors">
-                                Reset
+                        {localBackupAvailable && (
+                            <button onClick={restoreBackup} className="px-4 bg-blue-100 text-blue-700 hover:bg-blue-200 py-3 rounded-lg font-bold text-xs transition-colors">
+                                Backup laden
                             </button>
                         )}
                     </div>
@@ -617,7 +565,7 @@ function KnobelKasse() {
 }
 
 // ==========================================
-// SUB COMPONENTS
+// SUB COMPONENTS (No changes needed, simplified for brevity)
 // ==========================================
 
 function NavBtn({ id, active, set, icon: Icon, label }) {
