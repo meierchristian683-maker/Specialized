@@ -54,7 +54,9 @@ import {
   Copy,
   CheckCircle2,
   RefreshCw,
-  ArrowRight
+  ArrowRight,
+  Cloud, // Geändert von CloudUpload zu Cloud
+  Activity
 } from 'lucide-react';
 
 // ==========================================
@@ -162,6 +164,7 @@ function KnobelKasse() {
   const [isDemo, setIsDemo] = useState(false);
   const [connectionError, setConnectionError] = useState(null); 
   const [writeError, setWriteError] = useState(null);
+  const [successMsg, setSuccessMsg] = useState(null); // Feedback für Sync
   const [showDebug, setShowDebug] = useState(false);
   
   // WICHTIG: State für den aktuellen Raum (App ID)
@@ -185,6 +188,9 @@ function KnobelKasse() {
   const [events, setEvents] = useState([]);
   const [history, setHistory] = useState([]);
   const [pot, setPot] = useState({ balance: 0 });
+  
+  // Meta Data for Sync Check
+  const [lastServerSync, setLastServerSync] = useState(null);
 
   // Logs für Debugging
   const [logs, setLogs] = useState([]);
@@ -232,6 +238,8 @@ function KnobelKasse() {
     
     // ONLINE PFAD - Dynamisch basierend auf State
     const getPath = (col) => collection(db, 'artifacts', currentAppId, 'public', 'data', col);
+    // Meta Path for Sync Check
+    const getMetaDoc = () => doc(db, 'artifacts', currentAppId, 'public', 'data', 'knobel_meta', 'sync_status');
 
     const safeSnapshot = (colName, setter) => {
       return onSnapshot(getPath(colName), (snap) => {
@@ -246,7 +254,7 @@ function KnobelKasse() {
           }
           setter(data);
           // Logging nur beim ersten Laden oder Änderungen, um Spam zu vermeiden
-          if(data.length > 0) addLog(`${colName}: ${data.length} Items geladen.`);
+          if(data.length > 0) addLog(`${colName}: ${data.length} Items.`);
         },
         (err) => {
             console.error(`Read Error ${colName}:`, err);
@@ -259,12 +267,25 @@ function KnobelKasse() {
       );
     };
 
+    // Meta Listener für Heartbeat
+    const metaUnsub = onSnapshot(getMetaDoc(), (docSnap) => {
+        if(docSnap.exists()) {
+            const data = docSnap.data();
+            if(data.last_update) {
+                const date = new Date(data.last_update.seconds * 1000);
+                setLastServerSync(date.toLocaleTimeString());
+                addLog(`Server Ping: ${date.toLocaleTimeString()}`);
+            }
+        }
+    });
+
     const unsubs = [
         safeSnapshot('knobel_members', setMembers),
         safeSnapshot('knobel_catalog', setCatalog),
         safeSnapshot('knobel_events', setEvents),
         safeSnapshot('knobel_history', setHistory),
-        safeSnapshot('knobel_pot', setPot)
+        safeSnapshot('knobel_pot', setPot),
+        metaUnsub
     ];
 
     return () => unsubs.forEach(u => u && u());
@@ -322,6 +343,21 @@ function KnobelKasse() {
       localStorage.removeItem('knobel_custom_room_id');
       window.location.reload();
   }
+
+  // --- MANUAL SYNC TRIGGER ---
+  const handleManualSync = async () => {
+      if(isDemo) { alert("Offline Modus aktiv."); return; }
+      await safeWrite('Manueller Sync', async () => {
+          // Schreibt in ein Meta-Dokument, das alle Clients hören
+          const metaRef = doc(db, 'artifacts', currentAppId, 'public', 'data', 'knobel_meta', 'sync_status');
+          await setDoc(metaRef, { 
+              last_update: serverTimestamp(),
+              triggered_by: user.uid
+          }, { merge: true });
+          setSuccessMsg("Sync-Signal gesendet! 📡");
+          setTimeout(() => setSuccessMsg(null), 3000);
+      });
+  };
 
   // Action Wrappers
   const bookPenalty = (mId, mName, title, amount, cId) => safeWrite('Strafe buchen', async () => {
@@ -449,6 +485,13 @@ function KnobelKasse() {
           </div>
       )}
 
+      {/* SUCCESS TOAST */}
+      {successMsg && (
+          <div className="bg-green-600 text-white p-3 text-center font-bold text-sm shadow-xl z-50 animate-in fade-in zoom-in fixed top-20 left-1/2 -translate-x-1/2 rounded-full flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4" /> {successMsg}
+          </div>
+      )}
+
       {/* OFFLINE BANNER */}
       {isDemo && (
           <div className="bg-red-500 text-white px-4 py-2 text-center text-xs font-bold shadow-md flex justify-between items-center z-40 relative">
@@ -506,12 +549,23 @@ function KnobelKasse() {
                 </h3>
                 
                 <div className="space-y-4 text-sm">
+                    {/* MANUAL SAVE / SYNC TRIGGER */}
+                    <div className="bg-blue-50 p-4 rounded-xl border border-blue-200">
+                        <label className="text-xs uppercase font-bold text-blue-700 block mb-2 flex items-center gap-1"><Cloud className="w-3 h-3"/> Verbindung Testen</label>
+                        <p className="text-xs text-blue-800/70 mb-3">
+                           Funktioniert der Sync nicht? Drücke diesen Button. Wenn auf dem anderen Gerät "Letztes Signal" aktualisiert wird, steht die Verbindung.
+                        </p>
+                        <button onClick={handleManualSync} className="w-full bg-blue-600 text-white px-3 py-3 rounded-lg font-bold text-xs hover:bg-blue-700 transition-colors flex items-center justify-center gap-2 active:scale-95">
+                             <RefreshCw className="w-4 h-4" /> Manuell Synchronisieren
+                        </button>
+                        <div className="mt-2 text-xs text-center text-blue-600 font-mono">
+                            Letztes Signal vom Server: {lastServerSync || "Noch nie"}
+                        </div>
+                    </div>
+
                     {/* MANUAL ROOM OVERRIDE */}
                     <div className="bg-amber-50 p-4 rounded-xl border border-amber-200">
                         <label className="text-xs uppercase font-bold text-amber-700 block mb-2">Manuelle Raum-ID</label>
-                        <p className="text-xs text-amber-800/70 mb-3">
-                            Wenn Sync nicht geht: Gib hier auf allen Handys <b>exakt das gleiche Wort</b> ein (z.B. "MeinClub").
-                        </p>
                         <form onSubmit={handleRoomChange} className="flex gap-2">
                             <input 
                                 className="flex-1 p-2 rounded border border-amber-300 text-sm outline-none focus:border-amber-500 bg-white" 
@@ -887,8 +941,7 @@ function CashierView({ members, catalog, onBook, onPay }) {
       {payModal && activeMember && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4 backdrop-blur-sm animate-in fade-in">
           <div className="bg-white rounded-2xl w-full max-w-xs p-6 shadow-2xl">
-            <h3 className="font-bold mb-1">Zahlen für {activeMember.name}</h3>
-            <p className="text-xs text-slate-400 mb-4">Betrag ist anpassbar (Teilzahlung möglich).</p>
+            <h3 className="font-bold mb-4">Zahlen für {payModal.name}</h3>
             <form onSubmit={handlePay}>
               <input type="number" step="0.01" className="w-full text-3xl font-mono border-b-2 outline-none py-3 mb-6 text-center text-base" value={payAmount} onChange={e => setPayAmount(e.target.value)} autoFocus />
               <div className="flex gap-2 mb-4">
