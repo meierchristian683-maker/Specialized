@@ -17,7 +17,9 @@ import {
   getAuth, 
   signInWithCustomToken, 
   signInAnonymously, 
-  onAuthStateChanged 
+  onAuthStateChanged,
+  setPersistence,
+  browserLocalPersistence
 } from 'firebase/auth';
 import { 
   Users, 
@@ -50,7 +52,8 @@ import {
   Flame,
   Wifi,
   WifiOff,
-  Database
+  Database,
+  Globe
 } from 'lucide-react';
 
 // ==========================================
@@ -181,11 +184,12 @@ function KnobelKasse() {
   useEffect(() => {
     const initAuth = async () => {
       try {
-        // Zuerst versuchen wir den Token der Umgebung
+        // Versuch: Persistenz aktivieren (hilft manchmal, aber Public Path ist sicherer)
+        await setPersistence(auth, browserLocalPersistence);
+
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
           await signInWithCustomToken(auth, __initial_auth_token);
         } else {
-          // Sonst anonyme Anmeldung (benötigt Aktivierung in Firebase Console!)
           await signInAnonymously(auth);
         }
       } catch (err) {
@@ -194,7 +198,6 @@ function KnobelKasse() {
         let msg = err.message;
         let detail = "";
         
-        // Spezifische Fehleranalyse für den User
         if (err.code === 'auth/operation-not-allowed') {
             msg = "Anonyme Anmeldung deaktiviert!";
             detail = "Gehe in Firebase Console -> Authentication -> Sign-in method und aktiviere 'Anonymous'.";
@@ -219,7 +222,7 @@ function KnobelKasse() {
     });
   }, []);
 
-  // 2. Data Loading (Private User Paths)
+  // 2. Data Loading (Öffentliche Pfade für Beständigkeit)
   useEffect(() => {
     if (!user && !isDemo) return;
 
@@ -243,9 +246,10 @@ function KnobelKasse() {
 
     if (!db) return;
 
-    // HELPER: Pfad auf User-ID umgebogen
+    // HELPER: Öffentlicher Pfad (Public Data)
+    // Damit sehen alle Nutzer dieselben Daten, egal welche ID sie haben.
     const getSafeCol = (colName) => {
-        return collection(db, 'artifacts', appId, 'users', user.uid, colName);
+        return collection(db, 'artifacts', appId, 'public', 'data', colName);
     }
 
     const safeSnapshot = (colName, setter) => {
@@ -276,7 +280,7 @@ function KnobelKasse() {
 
             if (err.code === 'permission-denied') {
                 msg = "Datenbank Zugriff Verweigert!";
-                detail = "Gehe in Firebase Console -> Firestore Database -> Rules. Erlaube Zugriff (z.B. 'allow read, write: if true;').";
+                detail = "Prüfe Firebase Console -> Rules. Muss 'allow read, write: if true;' sein.";
             }
 
             setConnectionError(msg);
@@ -300,9 +304,9 @@ function KnobelKasse() {
     };
   }, [user, isDemo]);
 
-  // Helpers for Paths
-  const getCol = (name) => collection(db, 'artifacts', appId, 'users', user.uid, name);
-  const getDocRef = (name, id) => doc(db, 'artifacts', appId, 'users', user.uid, name, id);
+  // Helpers for Paths (Hier auch Public)
+  const getCol = (name) => collection(db, 'artifacts', appId, 'public', 'data', name);
+  const getDocRef = (name, id) => doc(db, 'artifacts', appId, 'public', 'data', name, id);
 
   // ACTIONS
   const bookPenalty = async (memberId, memberName, penaltyTitle, amount, catalogId) => {
@@ -841,8 +845,8 @@ function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelet
     if(!newMemberName.trim()) return;
     if (isDemo) onDemoAdd({ name: newMemberName });
     else {
-        // Korrigierter Pfad: Private User Data
-        const col = collection(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'knobel_members');
+        // Korrigierter Pfad: Public Data (für alle sichtbar)
+        const col = collection(db, 'artifacts', appId, 'public', 'data', 'knobel_members');
         await addDoc(col, { name: newMemberName, debt: 0, createdAt: serverTimestamp() });
     }
     setNewMemberName(''); setShowAdd(false);
@@ -852,7 +856,7 @@ function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelet
     if (isDemo) onDemoDelete(id);
     else {
         // Korrigierter Pfad
-        const docRef = doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'knobel_members', id);
+        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'knobel_members', id);
         await deleteDoc(docRef);
     }
     setDeleteId(null);
@@ -956,7 +960,7 @@ function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, isAd
         if(!title || !amount) return;
         if (isDemo) onDemoAdd({ title, amount: parseFloat(amount) });
         else {
-            const col = collection(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'knobel_catalog');
+            const col = collection(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog');
             await addDoc(col, { title, amount: parseFloat(amount), createdAt: serverTimestamp(), count: 0 });
         }
         setTitle(''); setAmount('');
@@ -965,7 +969,7 @@ function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, isAd
     const del = async (id) => { 
       if (isDemo) onDemoDelete(id);
       else {
-          const docRef = doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'knobel_catalog', id);
+          const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog', id);
           await deleteDoc(docRef); 
       }
       setDelId(null); 
@@ -1018,7 +1022,7 @@ function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, isAd
         e.preventDefault(); if(!date) return;
         if (isDemo) onDemoAdd({ date, time, location: loc });
         else {
-            const col = collection(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'knobel_events');
+            const col = collection(db, 'artifacts', appId, 'public', 'data', 'knobel_events');
             await addDoc(col, { date, time, location: loc, createdAt: serverTimestamp() });
         }
         setDate(''); setTime(''); setLoc('');
@@ -1027,7 +1031,7 @@ function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, isAd
     const del = async (id) => { 
       if (isDemo) onDemoDelete(id);
       else {
-          const docRef = doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'knobel_events', id);
+          const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'knobel_events', id);
           await deleteDoc(docRef); 
       }
       setDelId(null); 
