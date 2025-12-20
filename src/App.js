@@ -53,15 +53,16 @@ import {
   Wifi,
   WifiOff,
   Database,
-  Globe
+  Globe,
+  Info,
+  ExternalLink
 } from 'lucide-react';
 
 // ==========================================
-// 1. KONFIGURATION (Robust mit Fallback)
+// 1. KONFIGURATION (DEIN PROJEKT)
 // ==========================================
 
-// Deine manuelle Config als Sicherung
-const manualConfig = {
+const firebaseConfig = {
   apiKey: "AIzaSyD7iO59TiZVG8vhHpapmpO-IHID8jX_dzE",
   authDomain: "specialized-4b4c4.firebaseapp.com",
   projectId: "specialized-4b4c4",
@@ -70,29 +71,13 @@ const manualConfig = {
   appId: "1:610305729554:web:081b81ebb26dbf57e7a4cb"
 };
 
-let app, auth, db, configError;
+// Initialisierung
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
 
-try {
-  let firebaseConfig;
-  
-  // Prüfen, ob die automatische Variable existiert
-  if (typeof __firebase_config !== 'undefined') {
-    firebaseConfig = JSON.parse(__firebase_config);
-  } else {
-    // Fallback auf manuelle Config, wenn Variable fehlt
-    console.warn("Nutze manuelle Firebase Konfiguration.");
-    firebaseConfig = manualConfig;
-  }
-
-  app = initializeApp(firebaseConfig);
-  auth = getAuth(app);
-  db = getFirestore(app);
-} catch (e) {
-  console.error("Firebase Init Error:", e);
-  configError = e.message;
-}
-
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+// FIX: appId definieren, damit die Views nicht abstürzen
+const appId = "specialized-4b4c4";
 
 // ==========================================
 // 2. HEADER GRAFIK
@@ -106,23 +91,17 @@ function HeaderGraphic() {
            <feDropShadow dx="1" dy="2" stdDeviation="1" floodColor="rgba(0,0,0,0.3)"/>
          </filter>
        </defs>
-       
-       {/* Würfel 1 (Hintergrund - Amber) */}
        <g transform="rotate(-10 20 25)">
          <rect x="5" y="10" width="30" height="30" rx="6" fill="#F59E0B" filter="url(#shadow)" />
          <circle cx="13" cy="18" r="2.5" fill="white" />
          <circle cx="27" cy="32" r="2.5" fill="white" />
          <circle cx="20" cy="25" r="2.5" fill="white" />
        </g>
-
-       {/* Würfel 2 (Vordergrund - Weiß) */}
        <g transform="rotate(15 45 20)">
          <rect x="30" y="5" width="30" height="30" rx="6" fill="white" stroke="#F59E0B" strokeWidth="1.5" filter="url(#shadow)" />
          <circle cx="38" cy="13" r="2.5" fill="#F59E0B" />
          <circle cx="52" cy="27" r="2.5" fill="#F59E0B" />
        </g>
-
-       {/* Schriftzug */}
        <text x="75" y="36" fontFamily="sans-serif" fontWeight="900" fontSize="28" fill="white" letterSpacing="-0.5" filter="url(#shadow)">
          Specialized
        </text>
@@ -160,13 +139,11 @@ class ErrorBoundary extends React.Component {
 // ==========================================
 
 function KnobelKasse() {
-  if (configError) throw new Error("Initialisierungsfehler: " + configError);
-
   const [user, setUser] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isDemo, setIsDemo] = useState(false);
   const [connectionError, setConnectionError] = useState(null); 
-  const [detailedError, setDetailedError] = useState(null);
+  const [authErrorType, setAuthErrorType] = useState(null); // 'auth-disabled' | 'network' | 'other'
   
   // Admin State
   const [isAdmin, setIsAdmin] = useState(false);
@@ -184,31 +161,25 @@ function KnobelKasse() {
   useEffect(() => {
     const initAuth = async () => {
       try {
-        // Versuch: Persistenz aktivieren (hilft manchmal, aber Public Path ist sicherer)
         await setPersistence(auth, browserLocalPersistence);
-
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
+        await signInAnonymously(auth);
       } catch (err) {
-        console.error("Auth fehlgeschlagen:", err);
+        console.error("Auth Fehler:", err);
         
         let msg = err.message;
-        let detail = "";
+        let type = 'other';
         
         if (err.code === 'auth/operation-not-allowed') {
-            msg = "Anonyme Anmeldung deaktiviert!";
-            detail = "Gehe in Firebase Console -> Authentication -> Sign-in method und aktiviere 'Anonymous'.";
-        } else if (err.code === 'auth/api-key-not-valid') {
-            msg = "API Key ungültig!";
-            detail = "Prüfe den API Key in der Konfiguration.";
+            msg = "Anonyme Anmeldung ist in Firebase deaktiviert!";
+            type = 'auth-disabled';
+        } else if (err.code === 'auth/network-request-failed') {
+            msg = "Netzwerkfehler - Keine Verbindung zu Firebase.";
+            type = 'network';
         }
 
         setConnectionError(msg);
-        setDetailedError(detail);
-        setIsDemo(true);
+        setAuthErrorType(type);
+        setIsDemo(true); // Fallback zu Demo, damit App nicht crasht
       }
     };
     initAuth();
@@ -217,49 +188,37 @@ function KnobelKasse() {
         if (u) {
             setUser(u);
             setConnectionError(null);
-            setDetailedError(null);
+            setAuthErrorType(null);
+            setIsDemo(false); // Wenn User da ist, kein Demo Modus!
         }
     });
   }, []);
 
-  // 2. Data Loading (Öffentliche Pfade für Beständigkeit)
+  // 2. Data Loading (ROOT PATHS - Einfachste Struktur)
   useEffect(() => {
     if (!user && !isDemo) return;
 
     if (isDemo) {
       setMembers([
-        { id: '1', name: 'Max Mustermann', debt: 15.50 },
-        { id: '2', name: 'Erika Musterfrau', debt: 0 },
-        { id: '3', name: 'Lukas Podolski', debt: 5.00 },
+        { id: '1', name: 'Demo Max', debt: 15.50 },
+        { id: '2', name: 'Demo Erika', debt: 0 },
       ]);
-      setCatalog([
-        { id: 'c1', title: 'Zu spät', amount: 2.00, count: 5 },
-      ]);
-      setEvents([{ id: 'e1', date: '2024-12-24', time: '18:00', location: 'Vereinsheim' }]);
-      setPot({ balance: 45.50 });
-      setHistory([
-        { id: 'h1', text: 'Max Mustermann: Zu spät', amount: 2.00, type: 'penalty', createdAt: { seconds: Date.now() / 1000 } },
-        { id: 'h2', text: 'Max Mustermann hat eingezahlt', amount: -5.00, type: 'payment', createdAt: { seconds: (Date.now() - 10000) / 1000 } }
-      ]);
+      setCatalog([{ id: 'c1', title: 'Zu spät', amount: 2.00, count: 5 }]);
+      setHistory([]);
       return;
     }
 
     if (!db) return;
 
-    // HELPER: Öffentlicher Pfad (Public Data)
-    // Damit sehen alle Nutzer dieselben Daten, egal welche ID sie haben.
-    const getSafeCol = (colName) => {
-        return collection(db, 'artifacts', appId, 'public', 'data', colName);
-    }
+    // HELPER: Wir schreiben direkt in den Root der Datenbank
+    const getSafeCol = (colName) => collection(db, colName);
 
     const safeSnapshot = (colName, setter) => {
-      const colRef = getSafeCol(colName);
-      
-      return onSnapshot(colRef, (snap) => {
+      return onSnapshot(getSafeCol(colName), (snap) => {
           const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+          
+          // Client-Sortierung
           if (colName === 'knobel_members') data.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-          if (colName === 'knobel_catalog') data.sort((a, b) => (a.amount || 0) - (b.amount || 0));
-          if (colName === 'knobel_events') data.sort((a, b) => new Date(a.date) - new Date(b.date));
           if (colName === 'knobel_history') {
              data.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
              setter(data);
@@ -274,17 +233,10 @@ function KnobelKasse() {
         },
         (err) => {
             console.error(`Ladefehler ${colName}:`, err);
-            
-            let msg = `Datenbankfehler (${colName})`;
-            let detail = err.message;
-
+            setConnectionError(`DB Fehler: ${err.message}`);
             if (err.code === 'permission-denied') {
-                msg = "Datenbank Zugriff Verweigert!";
-                detail = "Prüfe Firebase Console -> Rules. Muss 'allow read, write: if true;' sein.";
+                setAuthErrorType('rules');
             }
-
-            setConnectionError(msg);
-            setDetailedError(detail);
         }
       );
     };
@@ -304,74 +256,31 @@ function KnobelKasse() {
     };
   }, [user, isDemo]);
 
-  // Helpers for Paths (Hier auch Public)
-  const getCol = (name) => collection(db, 'artifacts', appId, 'public', 'data', name);
-  const getDocRef = (name, id) => doc(db, 'artifacts', appId, 'public', 'data', name, id);
-
-  // ACTIONS
+  // Actions
   const bookPenalty = async (memberId, memberName, penaltyTitle, amount, catalogId) => {
-    if (isDemo) {
-      setMembers(prev => prev.map(m => m.id === memberId ? { ...m, debt: (m.debt || 0) + amount } : m));
-      if (catalogId) setCatalog(prev => prev.map(c => c.id === catalogId ? { ...c, count: (c.count || 0) + 1 } : c));
-      setHistory(prev => [{ id: Date.now(), text: `${memberName}: ${penaltyTitle}`, amount, type: 'penalty', createdAt: { seconds: Date.now()/1000 } }, ...prev]);
-      return;
-    }
-    if (!user || !db) return;
-
+    if (isDemo) return;
     try {
-      const memRef = getDocRef('knobel_members', memberId);
-      const histCol = getCol('knobel_history');
-
-      await updateDoc(memRef, { debt: increment(amount) });
-      if (catalogId) {
-          const catRef = getDocRef('knobel_catalog', catalogId);
-          await updateDoc(catRef, { count: increment(1) });
-      }
-      await addDoc(histCol, { text: `${memberName}: ${penaltyTitle}`, amount, type: 'penalty', createdAt: serverTimestamp() });
-    } catch (e) {
-      console.error("Fehler beim Buchen:", e);
-    }
+      await updateDoc(doc(db, 'knobel_members', memberId), { debt: increment(amount) });
+      if (catalogId) await updateDoc(doc(db, 'knobel_catalog', catalogId), { count: increment(1) });
+      await addDoc(collection(db, 'knobel_history'), { text: `${memberName}: ${penaltyTitle}`, amount, type: 'penalty', createdAt: serverTimestamp() });
+    } catch (e) { console.error(e); }
   };
 
   const payDebt = async (memberId, memberName, amount) => {
-    if (isDemo) {
-      setMembers(prev => prev.map(m => m.id === memberId ? { ...m, debt: Math.max(0, (m.debt || 0) - amount) } : m));
-      setPot(prev => ({ balance: (prev.balance || 0) + amount }));
-      setHistory(prev => [{ id: Date.now(), text: `${memberName} hat eingezahlt`, amount: -amount, type: 'payment', createdAt: { seconds: Date.now()/1000 } }, ...prev]);
-      return;
-    }
-    if (!user || !db) return;
-
+    if (isDemo) return;
     try {
-      const memRef = getDocRef('knobel_members', memberId);
-      const potRef = getDocRef('knobel_pot', 'main');
-      const histCol = getCol('knobel_history');
-      
-      await updateDoc(memRef, { debt: increment(-amount) });
-      await setDoc(potRef, { balance: increment(amount) }, { merge: true });
-      await addDoc(histCol, { text: `${memberName} hat eingezahlt`, amount: -amount, type: 'payment', createdAt: serverTimestamp() });
-    } catch (e) {
-      console.error("Fehler beim Zahlen:", e);
-    }
+      await updateDoc(doc(db, 'knobel_members', memberId), { debt: increment(-amount) });
+      await setDoc(doc(db, 'knobel_pot', 'main'), { balance: increment(amount) }, { merge: true });
+      await addDoc(collection(db, 'knobel_history'), { text: `${memberName} hat eingezahlt`, amount: -amount, type: 'payment', createdAt: serverTimestamp() });
+    } catch (e) { console.error(e); }
   };
 
   const bookExpense = async (title, amount) => {
-      if (isDemo) {
-          setPot(prev => ({ balance: (prev.balance || 0) - amount }));
-          setHistory(prev => [{ id: Date.now(), text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: { seconds: Date.now()/1000 } }, ...prev]);
-          return;
-      }
-      if (!user || !db) return;
-
+      if (isDemo) return;
       try {
-        const potRef = getDocRef('knobel_pot', 'main');
-        const histCol = getCol('knobel_history');
-
-        await setDoc(potRef, { balance: increment(-amount) }, { merge: true });
-        await addDoc(histCol, { text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: serverTimestamp() });
-      } catch (e) {
-        console.error("Fehler bei Ausgabe:", e);
-      }
+        await setDoc(doc(db, 'knobel_pot', 'main'), { balance: increment(-amount) }, { merge: true });
+        await addDoc(collection(db, 'knobel_history'), { text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: serverTimestamp() });
+      } catch (e) { console.error(e); }
   }
 
   // Demo Helpers
@@ -409,7 +318,6 @@ function KnobelKasse() {
             <HeaderGraphic />
             {isDemo && <span className="bg-amber-600 text-white text-[10px] px-2 py-0.5 rounded-md font-bold uppercase self-start mt-1">Demo</span>}
           </div>
-          
           <button 
             onClick={() => isAdmin ? setIsAdmin(false) : setShowAdminLogin(true)} 
             className={`p-2 rounded-full transition-colors ${isAdmin ? 'bg-amber-500 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'}`}
@@ -419,24 +327,36 @@ function KnobelKasse() {
         </div>
       </header>
 
-      {/* FEHLERMELDUNG BEI VERBINDUNGSPROBLEMEN */}
-      {connectionError && (
-          <div className="bg-red-50 border-b border-red-200 text-red-900 px-4 py-4 text-sm font-bold flex flex-col gap-1 shadow-lg animate-in slide-in-from-top-2">
-              <div className="flex items-center gap-2">
-                <AlertCircle className="w-5 h-5 shrink-0 text-red-600" />
-                <span className="uppercase tracking-wider">Fehler: {connectionError}</span>
+      {/* KRITISCHE FEHLERMELDUNGEN */}
+      {authErrorType === 'auth-disabled' && (
+          <div className="bg-red-600 text-white p-4 text-center animate-in slide-in-from-top-2 z-50">
+              <h3 className="font-bold text-lg mb-1 flex items-center justify-center gap-2"><AlertCircle /> Speichern blockiert!</h3>
+              <p className="text-sm opacity-90 mb-3">Die "Anonyme Anmeldung" ist in deiner Datenbank deaktiviert.</p>
+              <div className="bg-white/10 p-3 rounded text-left text-xs font-mono mb-3">
+                  1. Gehe zu <a href="https://console.firebase.google.com/" target="_blank" className="underline font-bold">Firebase Console</a><br/>
+                  2. Wähle dein Projekt "specialized-4b4c4"<br/>
+                  3. Klicke links auf <b>Build</b> {'>'} <b>Authentication</b><br/>
+                  4. Tab <b>Sign-in method</b> {'>'} <b>Anonymous</b> aktivieren.
               </div>
-              {detailedError && <p className="ml-7 text-xs font-normal text-red-700">{detailedError}</p>}
-              <div className="ml-7 mt-1 text-[10px] uppercase font-bold text-red-400">Daten werden NICHT gespeichert.</div>
+              <div className="text-[10px] uppercase font-bold bg-white/20 inline-block px-2 py-1 rounded">Bitte aktivieren und Seite neu laden</div>
           </div>
       )}
 
-      {/* STATUS INDIKATOR UNTEN RECHTS */}
-      <div className={`fixed bottom-20 right-4 z-50 text-[10px] px-2 py-1 rounded-full flex items-center gap-1 font-mono shadow-md ${connectionError ? 'bg-red-100 text-red-700' : (isDemo ? 'bg-amber-100 text-amber-700' : 'bg-green-100 text-green-700')}`}>
-         {connectionError ? <WifiOff className="w-3 h-3"/> : <Wifi className="w-3 h-3"/>}
-         {connectionError ? 'Offline/Fehler' : (isDemo ? 'Lokal (Demo)' : 'Live Verbunden')}
-      </div>
+      {authErrorType === 'rules' && (
+          <div className="bg-orange-500 text-white p-4 text-center animate-in slide-in-from-top-2 z-50">
+              <h3 className="font-bold text-lg mb-1">Keine Schreibrechte!</h3>
+              <p className="text-sm">Deine Firestore Rules blockieren den Zugriff.</p>
+              <div className="text-xs mt-2 bg-black/20 p-2 rounded">Setze Rules auf: <code>allow read, write: if true;</code></div>
+          </div>
+      )}
+      
+      {!authErrorType && isDemo && (
+          <div className="bg-amber-500 text-white px-4 py-2 text-center text-xs font-bold shadow-md">
+              ACHTUNG: DEMO MODUS - DATEN WERDEN NICHT GESPEICHERT!
+          </div>
+      )}
 
+      {/* CONTENT */}
       <main className="flex-1 overflow-y-auto bg-slate-50 pb-24 w-full">
         <div className="max-w-2xl mx-auto w-full">
           {activeTab === 'dashboard' && <DashboardView members={members} history={history} totalDebt={totalDebt} pot={pot} onExpense={bookExpense} catalog={catalog} isAdmin={isAdmin} />}
@@ -446,6 +366,13 @@ function KnobelKasse() {
           {activeTab === 'calendar' && <CalendarView events={events} db={db} appId={appId} isDemo={isDemo} onDemoAdd={(i)=>addDemoItem('events', i)} onDemoDelete={(id)=>deleteDemoItem('events', id)} isAdmin={isAdmin} />}
         </div>
       </main>
+
+      {/* FOOTER DEBUG INFO */}
+      <div className="bg-slate-100 p-2 text-[10px] text-slate-400 text-center border-t border-slate-200">
+          Projekt: specialized-4b4c4 • 
+          Status: {isDemo ? '⚠️ Offline/Demo' : '✅ Online/Live'} • 
+          User: {user ? 'Angemeldet' : 'Keiner'}
+      </div>
 
       <nav className="bg-white border-t border-slate-200 absolute bottom-0 w-full z-20 pb-6 pt-2">
         <div className="max-w-md mx-auto flex justify-between items-center px-4">
@@ -514,7 +441,6 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
 
     const sums = {};
     todayPenalties.forEach(h => {
-        // Name extrahieren ("Max: Zu spät" -> "Max")
         const name = h.text.split(':')[0].trim();
         sums[name] = (sums[name] || 0) + h.amount;
     });
@@ -531,24 +457,18 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
     return loser ? { name: loser, amount: maxAmount } : null;
   };
 
-  // --- LOGIK FÜR EWIGE BESTENLISTE (TOP 10 ABENDE) ---
   const getAllTimeHighscores = () => {
-      const eveningSums = {}; // Key: "YYYY-MM-DD_Name", Value: Summe
-
+      const eveningSums = {}; 
       history.filter(h => h.type === 'penalty' && h.createdAt).forEach(h => {
           const date = new Date(h.createdAt.seconds * 1000);
-          const dateStr = date.toLocaleDateString('de-DE'); // "20.12.2025"
+          const dateStr = date.toLocaleDateString('de-DE'); 
           const name = h.text.split(':')[0].trim();
           const key = `${dateStr}_${name}`;
           
           if (!eveningSums[key]) eveningSums[key] = { date: dateStr, name, amount: 0 };
           eveningSums[key].amount += h.amount;
       });
-
-      // In Array umwandeln und sortieren
-      return Object.values(eveningSums)
-          .sort((a, b) => b.amount - a.amount)
-          .slice(0, 10);
+      return Object.values(eveningSums).sort((a, b) => b.amount - a.amount).slice(0, 10);
   };
 
   const dailyLoser = getDailyLoser();
@@ -556,8 +476,6 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
 
   return (
     <div className="p-4 space-y-6 animate-in fade-in slide-in-from-bottom-4">
-      
-      {/* Cards Row */}
       <div className="grid grid-cols-2 gap-3">
           <div className="bg-slate-800 text-white p-4 rounded-2xl shadow-lg border border-slate-700 relative overflow-hidden">
             <div className="absolute top-0 right-0 w-16 h-16 bg-white/5 rounded-full -mr-8 -mt-8 blur-lg"></div>
@@ -576,7 +494,6 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
           </div>
       </div>
 
-      {/* LOSER DES ABENDS CARD (Nur anzeigen wenn es einen gibt) */}
       {dailyLoser && (
           <div className="bg-gradient-to-r from-red-500 to-orange-500 text-white p-4 rounded-2xl shadow-md flex items-center justify-between animate-in zoom-in duration-300">
               <div>
@@ -660,7 +577,6 @@ function DashboardView({ members, history, totalDebt, pot, onExpense, catalog, i
 
       {viewMode === 'stats' && (
          <div className="space-y-4 animate-in fade-in">
-             {/* EWIGE BESTENLISTE */}
              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
                  <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><Flame className="w-4 h-4 text-orange-500"/> Ewige Bestenliste (Top 10 Abende)</h3>
                  {allTimeHighscores.map((entry, i) => (
@@ -845,9 +761,8 @@ function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelet
     if(!newMemberName.trim()) return;
     if (isDemo) onDemoAdd({ name: newMemberName });
     else {
-        // Korrigierter Pfad: Public Data (für alle sichtbar)
-        const col = collection(db, 'artifacts', appId, 'public', 'data', 'knobel_members');
-        await addDoc(col, { name: newMemberName, debt: 0, createdAt: serverTimestamp() });
+        // Safe check
+        await addDoc(collection(db, 'knobel_members'), { name: newMemberName, debt: 0, createdAt: serverTimestamp() });
     }
     setNewMemberName(''); setShowAdd(false);
   };
@@ -855,9 +770,7 @@ function MembersView({ members, onPay, db, appId, isDemo, onDemoAdd, onDemoDelet
   const deleteMember = async (id) => {
     if (isDemo) onDemoDelete(id);
     else {
-        // Korrigierter Pfad
-        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'knobel_members', id);
-        await deleteDoc(docRef);
+        await deleteDoc(doc(db, 'knobel_members', id));
     }
     setDeleteId(null);
   };
@@ -960,8 +873,7 @@ function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, isAd
         if(!title || !amount) return;
         if (isDemo) onDemoAdd({ title, amount: parseFloat(amount) });
         else {
-            const col = collection(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog');
-            await addDoc(col, { title, amount: parseFloat(amount), createdAt: serverTimestamp(), count: 0 });
+            await addDoc(collection(db, 'knobel_catalog'), { title, amount: parseFloat(amount), createdAt: serverTimestamp(), count: 0 });
         }
         setTitle(''); setAmount('');
     };
@@ -969,8 +881,7 @@ function CatalogView({ catalog, db, appId, isDemo, onDemoAdd, onDemoDelete, isAd
     const del = async (id) => { 
       if (isDemo) onDemoDelete(id);
       else {
-          const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'knobel_catalog', id);
-          await deleteDoc(docRef); 
+          await deleteDoc(doc(db, 'knobel_catalog', id)); 
       }
       setDelId(null); 
     };
@@ -1022,8 +933,7 @@ function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, isAd
         e.preventDefault(); if(!date) return;
         if (isDemo) onDemoAdd({ date, time, location: loc });
         else {
-            const col = collection(db, 'artifacts', appId, 'public', 'data', 'knobel_events');
-            await addDoc(col, { date, time, location: loc, createdAt: serverTimestamp() });
+            await addDoc(collection(db, 'knobel_events'), { date, time, location: loc, createdAt: serverTimestamp() });
         }
         setDate(''); setTime(''); setLoc('');
     };
@@ -1031,8 +941,7 @@ function CalendarView({ events, db, appId, isDemo, onDemoAdd, onDemoDelete, isAd
     const del = async (id) => { 
       if (isDemo) onDemoDelete(id);
       else {
-          const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'knobel_events', id);
-          await deleteDoc(docRef); 
+          await deleteDoc(doc(db, 'knobel_events', id)); 
       }
       setDelId(null); 
     };
