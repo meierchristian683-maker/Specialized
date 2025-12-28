@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { initializeApp } from 'firebase/app';
 import { 
   getFirestore,
-  initializeFirestore, // WICHTIG: Neu importiert für spezielle Einstellungen
+  initializeFirestore, 
   collection, 
   addDoc, 
   onSnapshot, 
@@ -62,7 +62,8 @@ import {
   Database,
   AlertTriangle,
   Terminal,
-  Activity as DiagnosticIcon
+  Activity as DiagnosticIcon,
+  Shield
 } from 'lucide-react';
 
 // ==========================================
@@ -78,7 +79,7 @@ const manualConfig = {
 };
 
 // Logik zur Initialisierung
-let app, auth, db, configError;
+let app, auth, db, configError, connectionMode = "Unbekannt";
 
 try {
   let firebaseConfig = manualConfig;
@@ -96,15 +97,16 @@ try {
   auth = getAuth(app);
   
   // FIX: Wir erzwingen 'Long Polling' UND deaktivieren Fetch-Streams.
-  // Das ist die robusteste Einstellung gegen Firewalls und Proxies.
   try {
     db = initializeFirestore(app, {
       experimentalForceLongPolling: true,
-      useFetchStreams: false, // Hilft bei strikten Proxies
+      useFetchStreams: false, 
     });
+    connectionMode = "🛡️ Firewall-Modus (Long Polling)";
   } catch (e) {
-    // Falls initializeFirestore fehlschlägt (z.B. bei Hot-Reload), Fallback nutzen
+    // Fallback falls Hot-Reload die Initialisierung blockiert
     db = getFirestore(app);
+    connectionMode = "⚠️ Standard-Modus (Fallback)";
   }
 
 } catch (e) {
@@ -261,7 +263,7 @@ function KnobelKasse() {
           } catch (e) {
               if (e.message === "Timeout") {
                  addStep("Datenbank Schreiben", "ERROR", "Zeitüberschreitung (Timeout)");
-                 addStep("DIAGNOSE", "WARN", "Dein Netzwerk blockiert Google. Teste mal mobile Daten (WLAN aus)!");
+                 addStep("DIAGNOSE", "WARN", "WLAN blockiert Datenbank? Versuche mobile Daten!");
               } else {
                  addStep("Datenbank Schreiben", "ERROR", `Fehler: ${e.code}`);
                  if (e.code === 'permission-denied') {
@@ -682,9 +684,15 @@ function KnobelKasse() {
                         )}
                     </div>
 
+                    {/* LOGS */}
                     <div className="bg-slate-900 text-slate-300 p-3 rounded-lg border border-slate-700 h-48 overflow-y-auto font-mono text-[10px]">
                         {logs.length === 0 && <div className="text-slate-600 italic">Keine Logs...</div>}
                         {logs.map((l, i) => <div key={i} className="border-b border-slate-800 last:border-0 pb-1 mb-1 break-all">{l}</div>)}
+                    </div>
+
+                    {/* CONNECTION MODE INFO */}
+                    <div className="text-[10px] text-slate-400 text-center font-mono border-t border-slate-100 pt-2">
+                        Verbindungs-Modus: <span className={connectionMode.includes('Standard') ? 'text-red-500 font-bold' : 'text-green-600 font-bold'}>{connectionMode}</span>
                     </div>
 
                     <div className="flex gap-2 mt-2">
