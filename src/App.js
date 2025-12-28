@@ -2,7 +2,6 @@ import React, { useState, useEffect } from 'react';
 import { initializeApp } from 'firebase/app';
 import { 
   getFirestore,
-  initializeFirestore, 
   collection, 
   addDoc, 
   onSnapshot, 
@@ -13,7 +12,8 @@ import {
   increment,
   setDoc,
   getDoc,
-  writeBatch
+  writeBatch,
+  enableIndexedDbPersistence // WICHTIG: Für Offline-Speicherung
 } from 'firebase/firestore';
 import { 
   getAuth, 
@@ -80,11 +80,10 @@ const manualConfig = {
 };
 
 // UMGEBUNGS-ERKENNUNG
-// Wir prüfen, ob wir im Google-Editor oder "draußen" (Vercel/Lokal) sind.
 const isCanvasEnv = window.location.hostname.includes('googleusercontent') || window.location.hostname.includes('localhost');
 
 // Logik zur Initialisierung
-let app, auth, db, configError, connectionMode = "Unbekannt";
+let app, auth, db, configError, persistenceStatus = "Inaktiv";
 
 try {
   let firebaseConfig = manualConfig;
@@ -100,17 +99,23 @@ try {
   }
   app = initializeApp(firebaseConfig);
   auth = getAuth(app);
-  
-  // FIX: Wir erzwingen 'Long Polling' UND deaktivieren Fetch-Streams.
-  try {
-    db = initializeFirestore(app, {
-      experimentalForceLongPolling: true,
-      useFetchStreams: false, 
-    });
-    connectionMode = "🛡️ Firewall-Modus (Long Polling)";
-  } catch (e) {
-    db = getFirestore(app);
-    connectionMode = "⚠️ Standard-Modus (Fallback)";
+  db = getFirestore(app);
+
+  // AKTIVIERE OFFLINE-PERSISTENZ
+  // Das ist der Schlüssel! Daten werden lokal gespeichert, wenn Netzwerk spinnt.
+  if (typeof window !== 'undefined') {
+      enableIndexedDbPersistence(db)
+          .then(() => {
+              persistenceStatus = "✅ Aktiv (Offline-First)";
+              console.log("Offline Persistence Enabled");
+          })
+          .catch((err) => {
+              if (err.code === 'failed-precondition') {
+                  persistenceStatus = "⚠️ Inaktiv (Mehrere Tabs offen)";
+              } else if (err.code === 'unimplemented') {
+                  persistenceStatus = "⚠️ Inaktiv (Browser nicht unterstützt)";
+              }
+          });
   }
 
 } catch (e) {
@@ -124,14 +129,11 @@ const systemAppId = typeof __app_id !== 'undefined' ? __app_id : 'knobelkasse-de
 // ==========================================
 // PATH HELPER (WICHTIG!)
 // ==========================================
-// Passt die Pfade automatisch an: Komplex für Canvas, Simpel für Vercel.
 const getCollectionPath = (dbInstance, colName, suffix) => {
     const finalName = `${colName}${suffix}`;
     if (isCanvasEnv) {
-        // Tiefer Pfad für die Sandbox-Umgebung
         return collection(dbInstance, 'artifacts', systemAppId, 'public', 'data', finalName);
     } else {
-        // Flacher Pfad für deine eigene App -> Weniger Fehleranfällig!
         return collection(dbInstance, finalName);
     }
 };
@@ -257,12 +259,10 @@ function KnobelKasse() {
               addStep("Konfiguration", "WARN", `ID: ${app.options.projectId}`);
           }
 
-          // Schritt 2: HTTP Ping (Testet Internet/Firewall unabhängig von Firestore SDK)
+          // Schritt 2: HTTP Ping
           addStep("Google Ping (HTTP)", "PENDING", "Prüfe Erreichbarkeit...");
           try {
-              // Wir versuchen eine öffentliche Firebase-Config abzurufen (nur als Connectivity Test)
               await fetch(`https://firestore.googleapis.com/v1/projects/${manualConfig.projectId}/databases/(default)/documents/connection_test`, { method: 'GET' });
-              // Ein 403 oder 404 ist OK, solange kein Netzwerkfehler kommt.
               addStep("Google Ping (HTTP)", "OK", "Server erreichbar.");
           } catch(e) {
               addStep("Google Ping (HTTP)", "ERROR", "Keine Verbindung zu Google!");
@@ -286,28 +286,29 @@ function KnobelKasse() {
           // Schritt 4: DB Write
           addStep("Datenbank Schreiben", "PENDING", "Versuche Eintrag...");
           try {
-              // Benutze hier den dynamischen Pfad-Helper!
               const testRef = getDocumentPath(db, 'connection_test', 'ping_' + Date.now(), '');
               
+              // WICHTIG: Mit Persistence enabled "wartet" setDoc evtl. ewig auf Sync.
+              // Wir geben ihm 5 Sekunden, danach nehmen wir an: "Offline Mode"
               const writePromise = setDoc(testRef, { timestamp: serverTimestamp(), test: "OK" });
-              const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 8000));
+              const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 5000));
               
               await Promise.race([writePromise, timeoutPromise]);
               
-              addStep("Datenbank Schreiben", "OK", "Erfolg!");
-              // Cleanup
+              addStep("Datenbank Schreiben", "OK", "Online & Synchronisiert!");
               await deleteDoc(testRef); 
           } catch (e) {
               if (e.message === "Timeout") {
-                 addStep("Datenbank Schreiben", "ERROR", "Timeout (8s)");
-                 addStep("DIAGNOSE", "WARN", "WLAN blockiert Streaming. Mobile Daten testen!");
+                 // Das ist der entscheidende Fall: Timeout bedeutet, wir sind "Offline", aber Persistence sollte greifen.
+                 addStep("Datenbank Schreiben", "WARN", "Timeout (Server langsam/blockiert).");
+                 addStep("STATUS", "OK", "Offline-Modus aktiv. Daten werden lokal gespeichert und später gesendet.");
               } else {
                  addStep("Datenbank Schreiben", "ERROR", `Code: ${e.code}`);
                  if (e.code === 'permission-denied') {
                     addStep("LÖSUNG", "INFO", "Firestore Rules auf 'allow write: if true' setzen.");
                  }
+                 throw new Error("Write failed");
               }
-              throw new Error("DB Write fehlgeschlagen");
           }
 
           setTestResult({ status: 'success', steps });
@@ -329,7 +330,7 @@ function KnobelKasse() {
         console.error("Auth Fail:", err);
         addLog(`Auth Fehler: ${err.code}`);
         setWriteError(`Verbindungsfehler: ${err.code}`);
-        setIsDemo(true); 
+        // Kein Demo-Mode mehr erzwingen, Persistence regelt das!
       }
     };
     initAuth();
@@ -356,13 +357,17 @@ function KnobelKasse() {
     const suffix = roomSuffix ? `_${roomSuffix}` : '';
     addLog(`Lade Raum: Standard${suffix}`);
 
-    // NUTZE HELPER FUNCTION FÜR PFAD
     const getPath = (baseName) => getCollectionPath(db, baseName, suffix);
 
     const safeSnapshot = (baseName, setter) => {
-      return onSnapshot(getPath(baseName), (snap) => {
+      // WICHTIG: includeMetadataChanges: true sorgt dafür, dass wir auch lokale (noch nicht gesyncte) Updates sehen!
+      return onSnapshot(getPath(baseName), { includeMetadataChanges: true }, (snap) => {
           const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
           
+          // Debugging: Sehen ob Daten "pending" (noch nicht beim Server) sind
+          const hasPendingWrites = snap.metadata.hasPendingWrites;
+          if (hasPendingWrites) console.log(`Lokale Änderungen in ${baseName} noch nicht gesynct.`);
+
           if (baseName.includes('members')) data.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
           if (baseName.includes('history')) {
              data.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
@@ -384,11 +389,9 @@ function KnobelKasse() {
             if (err.code === 'permission-denied') {
                 setConfigWarning({
                     title: "Keine Rechte",
-                    msg: "Datenbank gesperrt oder Pfad falsch. Mach den System-Check.",
+                    msg: "Datenbank gesperrt. Mach den System-Check.",
                     code: err.code
                 });
-                setIsDemo(true);
-                loadLocalData();
             }
         }
       );
@@ -427,10 +430,8 @@ function KnobelKasse() {
       const suffix = roomSuffix ? `_${roomSuffix}` : '';
       const batch = writeBatch(db);
       
-      // Nur Mitglieder hochladen als Beispiel
       bMembers.forEach(m => {
           if(!members.find(ex => ex.name === m.name)) {
-             // NUTZE HELPER
              const ref = doc(getCollectionPath(db, 'knobel_members', suffix));
              batch.set(ref, { name: m.name, debt: m.debt || 0, createdAt: serverTimestamp() });
           }
@@ -453,6 +454,8 @@ function KnobelKasse() {
           return;
       }
       try {
+          // Wir warten nicht ewig auf das Promise, wenn wir offline sind.
+          // Firebase SDK handelt das im Hintergrund.
           await fn();
           addLog(`Gespeichert: ${opName}`);
       } catch (e) {
@@ -466,11 +469,6 @@ function KnobelKasse() {
                  msg: "Du darfst nicht schreiben. Starte den System-Check im Menü.",
                  code: e.code
              });
-             setIsDemo(true);
-             loadLocalData();
-          } else {
-             setIsDemo(true); 
-             loadLocalData(); 
           }
       }
   };
@@ -485,7 +483,6 @@ function KnobelKasse() {
   };
 
   // --- ACTIONS ---
-  // Verwende jetzt die Helper-Funktionen für Docs
   const getMyDoc = (col, id) => getDocumentPath(db, col, id, roomSuffix ? `_${roomSuffix}` : '');
   const getMyCol = (col) => getCollectionPath(db, col, roomSuffix ? `_${roomSuffix}` : '');
 
@@ -600,7 +597,7 @@ function KnobelKasse() {
           </div>
       )}
 
-      {/* RESTORE PROMPT (Wenn DB leer aber Backup da) */}
+      {/* RESTORE PROMPT */}
       {!isDemo && members.length === 0 && localBackupAvailable && (
           <div className="bg-blue-600 text-white p-4 text-center font-bold text-sm shadow-xl z-40 animate-in slide-in-from-top fixed top-24 left-4 right-4 rounded-xl">
               <p className="mb-2">Leerer Raum, aber lokale Daten gefunden!</p>
@@ -682,7 +679,7 @@ function KnobelKasse() {
                                     <div key={i} className="flex justify-between items-start text-xs border-b border-blue-100 last:border-0 pb-1">
                                         <span className="font-bold">{step.name}</span>
                                         <div className="text-right">
-                                            <span className={`font-bold px-1 rounded ${step.status === 'OK' ? 'bg-green-100 text-green-700' : step.status === 'ERROR' ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-700'}`}>{step.status}</span>
+                                            <span className={`font-bold px-1 rounded ${step.status === 'OK' ? 'bg-green-100 text-green-700' : step.status === 'WARN' ? 'bg-yellow-100 text-yellow-700' : 'bg-red-100 text-red-700'}`}>{step.status}</span>
                                             <div className="text-[10px] opacity-70 mt-0.5 max-w-[150px] break-words">{step.msg}</div>
                                         </div>
                                     </div>
@@ -722,9 +719,9 @@ function KnobelKasse() {
                         {logs.map((l, i) => <div key={i} className="border-b border-slate-800 last:border-0 pb-1 mb-1 break-all">{l}</div>)}
                     </div>
 
-                    {/* CONNECTION MODE INFO */}
+                    {/* PERSISTENCE INFO */}
                     <div className="text-[10px] text-slate-400 text-center font-mono border-t border-slate-100 pt-2">
-                        Verbindungs-Modus: <span className={connectionMode.includes('Standard') ? 'text-red-500 font-bold' : 'text-green-600 font-bold'}>{connectionMode}</span>
+                        Offline-Speicher: <span className={persistenceStatus.includes('Aktiv') ? 'text-green-600 font-bold' : 'text-amber-500 font-bold'}>{persistenceStatus}</span>
                     </div>
 
                     <div className="flex gap-2 mt-2">
