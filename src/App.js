@@ -60,7 +60,8 @@ import {
   Save,
   Database,
   AlertTriangle,
-  Terminal
+  Terminal,
+  Activity as DiagnosticIcon
 } from 'lucide-react';
 
 // ==========================================
@@ -80,12 +81,17 @@ let app, auth, db, configError;
 
 try {
   let firebaseConfig = manualConfig;
-  // Fallback für die Vorschau-Umgebung hier im Chat
+  // Auf Vercel/Github nutzen wir NUR deine manuelle Config.
+  // Der folgende Block ist nur für die Vorschau hier im Chat relevant.
   if (typeof __firebase_config !== 'undefined' && __firebase_config) {
     try {
-      firebaseConfig = JSON.parse(__firebase_config);
+      // Wir ignorieren die interne Config hier, um sicherzustellen, dass deine genutzt wird,
+      // es sei denn, wir sind wirklich im Editor-Modus.
+      if (window.location.hostname.includes('googleusercontent')) {
+         firebaseConfig = JSON.parse(__firebase_config);
+      }
     } catch (e) {
-      console.warn("Auto-Config fehlgeschlagen, nutze Fallback.");
+      console.warn("Auto-Config übersprungen.");
     }
   }
   app = initializeApp(firebaseConfig);
@@ -168,6 +174,9 @@ function KnobelKasse() {
   const [localBackupAvailable, setLocalBackupAvailable] = useState(false);
   const [configWarning, setConfigWarning] = useState(null);
   
+  // DIAGNOSE STATE
+  const [testResult, setTestResult] = useState(null);
+
   // RAUM LOGIK (Suffix basierend)
   const [roomSuffix, setRoomSuffix] = useState(() => {
       try { return localStorage.getItem('knobel_room_suffix') || ''; } 
@@ -191,41 +200,75 @@ function KnobelKasse() {
   const [logs, setLogs] = useState([]);
   const addLog = (msg) => setLogs(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 20));
 
+  // DIAGNOSE FUNKTION
+  const runConnectionTest = async () => {
+      setTestResult({ status: 'loading', steps: [] });
+      const steps = [];
+      const addStep = (name, status, msg) => {
+          steps.push({ name, status, msg });
+          setTestResult({ status: 'running', steps: [...steps] });
+      };
+
+      try {
+          // Schritt 1: Config
+          if (app.options.projectId === "specialized-4b4c4") {
+              addStep("Konfiguration", "OK", "Projekt ID erkannt (specialized-4b4c4).");
+          } else {
+              addStep("Konfiguration", "WARN", `Andere Projekt ID: ${app.options.projectId}`);
+          }
+
+          // Schritt 2: Auth
+          addStep("Authentifizierung", "PENDING", "Versuche anonymen Login...");
+          let currentUser = auth.currentUser;
+          try {
+              if (!currentUser) {
+                  const cred = await signInAnonymously(auth);
+                  currentUser = cred.user;
+              }
+              addStep("Authentifizierung", "OK", `Angemeldet als ${currentUser.uid.slice(0,4)}...`);
+          } catch (e) {
+              addStep("Authentifizierung", "ERROR", `Fehler: ${e.code}`);
+              if (e.code === 'auth/operation-not-allowed' || e.code === 'auth/admin-restricted-operation') {
+                  addStep("LÖSUNG (Wichtig!)", "INFO", "Gehe zu Firebase Console -> Authentication -> Sign-in method -> 'Anonym' aktivieren!");
+              }
+              throw new Error("Auth fehlgeschlagen");
+          }
+
+          // Schritt 3: DB Write
+          addStep("Datenbank Schreiben", "PENDING", "Versuche Test-Eintrag...");
+          try {
+              const testRef = doc(collection(db, 'connection_test'), 'ping_' + Date.now());
+              await setDoc(testRef, { timestamp: serverTimestamp(), test: "OK" });
+              addStep("Datenbank Schreiben", "OK", "Schreiben erfolgreich.");
+              // Cleanup
+              await deleteDoc(testRef); 
+          } catch (e) {
+              addStep("Datenbank Schreiben", "ERROR", `Fehler: ${e.code}`);
+              if (e.code === 'permission-denied') {
+                  addStep("LÖSUNG (Wichtig!)", "INFO", "Gehe zu Firestore -> Regeln -> Ändere auf: 'allow read, write: if true;'");
+              }
+              throw new Error("DB Write fehlgeschlagen");
+          }
+
+          setTestResult({ status: 'success', steps });
+
+      } catch (e) {
+          setTestResult(prev => ({ status: 'error', steps: prev.steps }));
+      }
+  };
+
   // 1. AUTH
   useEffect(() => {
     const initAuth = async () => {
       try {
         await setPersistence(auth, browserLocalPersistence);
-        let u = auth.currentUser;
-        if (!u) {
-            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                const cred = await signInWithCustomToken(auth, __initial_auth_token);
-                u = cred.user;
-            } else {
-                // Versuche Anonymen Login - WICHTIGSTER PUNKT
-                addLog("Versuche Anonymen Login...");
-                const cred = await signInAnonymously(auth);
-                u = cred.user;
-            }
+        if (!auth.currentUser) {
+            await signInAnonymously(auth);
         }
-        setUser(u);
-        setIsDemo(false);
-        addLog(`Erfolg: Angemeldet (${u.uid.slice(0,4)}...)`);
       } catch (err) {
         console.error("Auth Fail:", err);
         addLog(`Auth Fehler: ${err.code}`);
-        
-        // PRÜFUNG: Ist Auth in der Console deaktiviert?
-        if (err.code === 'auth/operation-not-allowed' || err.code === 'auth/admin-restricted-operation') {
-            setConfigWarning({
-                title: "Login Deaktiviert",
-                msg: "Du musst 'Anonyme Anmeldung' in der Firebase Console unter Authentication aktivieren!",
-                code: err.code
-            });
-        } else {
-            setWriteError(`Login Fehler: ${err.message}`);
-        }
-        
+        setWriteError(`Verbindungsfehler: ${err.code}`);
         setIsDemo(true); 
       }
     };
@@ -234,6 +277,7 @@ function KnobelKasse() {
         if (u) {
             setUser(u);
             setIsDemo(false);
+            addLog(`Online: ${u.uid.slice(0,3)}...`);
         }
     });
   }, []);
@@ -284,7 +328,7 @@ function KnobelKasse() {
             if (err.code === 'permission-denied') {
                 setConfigWarning({
                     title: "Keine Rechte",
-                    msg: "Die Datenbank ist gesperrt. Ändere die 'Rules' in Firestore auf 'allow read, write: if true;'",
+                    msg: "Die Datenbank ist gesperrt. Klicke auf 'Lobby' -> 'System-Check' für Details.",
                     code: err.code
                 });
                 setIsDemo(true);
@@ -366,7 +410,7 @@ function KnobelKasse() {
           if (e.code === 'permission-denied') {
              setConfigWarning({
                  title: "Keine Schreibrechte",
-                 msg: "Du darfst nicht schreiben. Prüfe die Firestore Rules.",
+                 msg: "Du darfst nicht schreiben. Starte den System-Check im Menü.",
                  code: e.code
              });
              setIsDemo(true);
@@ -565,11 +609,36 @@ function KnobelKasse() {
                 <button onClick={() => setShowDebug(false)} className="absolute top-2 right-2 p-2 text-slate-400 hover:text-slate-600"><X className="w-5 h-5"/></button>
                 
                 <h3 className="font-bold text-lg mb-4 flex items-center gap-2 text-slate-800">
-                    <Terminal className="w-5 h-5"/> System Logs
+                    <Terminal className="w-5 h-5"/> Einstellungen
                 </h3>
                 
                 <div className="space-y-4 text-sm">
                     
+                    {/* SYSTEM DIAGNOSTICS */}
+                    <div className="bg-blue-50 p-4 rounded-xl border border-blue-200">
+                        <h4 className="font-bold text-blue-800 flex items-center gap-2 mb-2"><DiagnosticIcon className="w-4 h-4"/> System Check</h4>
+                        {!testResult ? (
+                            <button onClick={runConnectionTest} className="w-full bg-blue-600 text-white py-2 rounded font-bold hover:bg-blue-700 transition-colors">
+                                System-Check starten
+                            </button>
+                        ) : (
+                            <div className="space-y-2">
+                                {testResult.steps.map((step, i) => (
+                                    <div key={i} className="flex justify-between items-start text-xs border-b border-blue-100 last:border-0 pb-1">
+                                        <span className="font-bold">{step.name}</span>
+                                        <div className="text-right">
+                                            <span className={`font-bold px-1 rounded ${step.status === 'OK' ? 'bg-green-100 text-green-700' : step.status === 'ERROR' ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-700'}`}>{step.status}</span>
+                                            <div className="text-[10px] opacity-70 mt-0.5 max-w-[150px] break-words">{step.msg}</div>
+                                        </div>
+                                    </div>
+                                ))}
+                                <button onClick={runConnectionTest} className="w-full bg-blue-100 text-blue-700 py-1 mt-2 rounded text-xs font-bold hover:bg-blue-200 transition-colors">
+                                    Nochmal testen
+                                </button>
+                            </div>
+                        )}
+                    </div>
+
                     {/* ROOM SELECTOR */}
                     <div className="bg-amber-50 p-4 rounded-xl border border-amber-200">
                         <label className="text-xs uppercase font-bold text-amber-700 block mb-2">Dein Raum-Name</label>
