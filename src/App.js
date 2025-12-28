@@ -63,7 +63,8 @@ import {
   AlertTriangle,
   Terminal,
   Activity as DiagnosticIcon,
-  Shield
+  Shield,
+  Globe
 } from 'lucide-react';
 
 // ==========================================
@@ -78,15 +79,19 @@ const manualConfig = {
   appId: "1:610305729554:web:081b81ebb26dbf57e7a4cb"
 };
 
+// UMGEBUNGS-ERKENNUNG
+// Wir prüfen, ob wir im Google-Editor oder "draußen" (Vercel/Lokal) sind.
+const isCanvasEnv = window.location.hostname.includes('googleusercontent') || window.location.hostname.includes('localhost');
+
 // Logik zur Initialisierung
 let app, auth, db, configError, connectionMode = "Unbekannt";
 
 try {
   let firebaseConfig = manualConfig;
-  // Fallback für die Vorschau-Umgebung hier im Chat
+  
   if (typeof __firebase_config !== 'undefined' && __firebase_config) {
     try {
-      if (window.location.hostname.includes('googleusercontent')) {
+      if (isCanvasEnv) {
          firebaseConfig = JSON.parse(__firebase_config);
       }
     } catch (e) {
@@ -104,7 +109,6 @@ try {
     });
     connectionMode = "🛡️ Firewall-Modus (Long Polling)";
   } catch (e) {
-    // Fallback falls Hot-Reload die Initialisierung blockiert
     db = getFirestore(app);
     connectionMode = "⚠️ Standard-Modus (Fallback)";
   }
@@ -114,8 +118,32 @@ try {
   configError = e.message;
 }
 
-// SYSTEM-ID (Standard für eigene Projekte: 'default-lobby')
+// SYSTEM-ID (Nur für Canvas relevant)
 const systemAppId = typeof __app_id !== 'undefined' ? __app_id : 'knobelkasse-default-lobby';
+
+// ==========================================
+// PATH HELPER (WICHTIG!)
+// ==========================================
+// Passt die Pfade automatisch an: Komplex für Canvas, Simpel für Vercel.
+const getCollectionPath = (dbInstance, colName, suffix) => {
+    const finalName = `${colName}${suffix}`;
+    if (isCanvasEnv) {
+        // Tiefer Pfad für die Sandbox-Umgebung
+        return collection(dbInstance, 'artifacts', systemAppId, 'public', 'data', finalName);
+    } else {
+        // Flacher Pfad für deine eigene App -> Weniger Fehleranfällig!
+        return collection(dbInstance, finalName);
+    }
+};
+
+const getDocumentPath = (dbInstance, colName, docId, suffix) => {
+    const finalName = `${colName}${suffix}`;
+    if (isCanvasEnv) {
+        return doc(dbInstance, 'artifacts', systemAppId, 'public', 'data', finalName, docId);
+    } else {
+        return doc(dbInstance, finalName, docId);
+    }
+};
 
 // ==========================================
 // HEADER GRAFIK
@@ -224,12 +252,24 @@ function KnobelKasse() {
       try {
           // Schritt 1: Config
           if (app.options.projectId === "specialized-4b4c4") {
-              addStep("Konfiguration", "OK", "Projekt ID erkannt (specialized-4b4c4).");
+              addStep("Konfiguration", "OK", "Projekt ID korrekt.");
           } else {
-              addStep("Konfiguration", "WARN", `Andere Projekt ID: ${app.options.projectId}`);
+              addStep("Konfiguration", "WARN", `ID: ${app.options.projectId}`);
           }
 
-          // Schritt 2: Auth
+          // Schritt 2: HTTP Ping (Testet Internet/Firewall unabhängig von Firestore SDK)
+          addStep("Google Ping (HTTP)", "PENDING", "Prüfe Erreichbarkeit...");
+          try {
+              // Wir versuchen eine öffentliche Firebase-Config abzurufen (nur als Connectivity Test)
+              await fetch(`https://firestore.googleapis.com/v1/projects/${manualConfig.projectId}/databases/(default)/documents/connection_test`, { method: 'GET' });
+              // Ein 403 oder 404 ist OK, solange kein Netzwerkfehler kommt.
+              addStep("Google Ping (HTTP)", "OK", "Server erreichbar.");
+          } catch(e) {
+              addStep("Google Ping (HTTP)", "ERROR", "Keine Verbindung zu Google!");
+              throw new Error("Netzwerk blockiert");
+          }
+
+          // Schritt 3: Auth
           addStep("Authentifizierung", "PENDING", "Versuche anonymen Login...");
           let currentUser = auth.currentUser;
           try {
@@ -237,37 +277,34 @@ function KnobelKasse() {
                   const cred = await signInAnonymously(auth);
                   currentUser = cred.user;
               }
-              addStep("Authentifizierung", "OK", `Angemeldet als ${currentUser.uid.slice(0,4)}...`);
+              addStep("Authentifizierung", "OK", `Angemeldet (${currentUser.uid.slice(0,3)})`);
           } catch (e) {
               addStep("Authentifizierung", "ERROR", `Fehler: ${e.code}`);
-              if (e.code === 'auth/operation-not-allowed' || e.code === 'auth/admin-restricted-operation') {
-                  addStep("LÖSUNG (Wichtig!)", "INFO", "Gehe zu Firebase Console -> Authentication -> Sign-in method -> 'Anonym' aktivieren!");
-              }
               throw new Error("Auth fehlgeschlagen");
           }
 
-          // Schritt 3: DB Write
-          addStep("Datenbank Schreiben", "PENDING", "Versuche Test-Eintrag (Timeout 10s)...");
+          // Schritt 4: DB Write
+          addStep("Datenbank Schreiben", "PENDING", "Versuche Eintrag...");
           try {
-              const testRef = doc(collection(db, 'connection_test'), 'ping_' + Date.now());
+              // Benutze hier den dynamischen Pfad-Helper!
+              const testRef = getDocumentPath(db, 'connection_test', 'ping_' + Date.now(), '');
               
-              // Race condition: Write vs Timeout
               const writePromise = setDoc(testRef, { timestamp: serverTimestamp(), test: "OK" });
-              const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 10000));
+              const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 8000));
               
               await Promise.race([writePromise, timeoutPromise]);
               
-              addStep("Datenbank Schreiben", "OK", "Schreiben erfolgreich.");
+              addStep("Datenbank Schreiben", "OK", "Erfolg!");
               // Cleanup
               await deleteDoc(testRef); 
           } catch (e) {
               if (e.message === "Timeout") {
-                 addStep("Datenbank Schreiben", "ERROR", "Zeitüberschreitung (Timeout)");
-                 addStep("DIAGNOSE", "WARN", "WLAN blockiert Datenbank? Versuche mobile Daten!");
+                 addStep("Datenbank Schreiben", "ERROR", "Timeout (8s)");
+                 addStep("DIAGNOSE", "WARN", "WLAN blockiert Streaming. Mobile Daten testen!");
               } else {
-                 addStep("Datenbank Schreiben", "ERROR", `Fehler: ${e.code}`);
+                 addStep("Datenbank Schreiben", "ERROR", `Code: ${e.code}`);
                  if (e.code === 'permission-denied') {
-                    addStep("LÖSUNG (Wichtig!)", "INFO", "Gehe zu Firestore -> Regeln -> Ändere auf: 'allow read, write: if true;'");
+                    addStep("LÖSUNG", "INFO", "Firestore Rules auf 'allow write: if true' setzen.");
                  }
               }
               throw new Error("DB Write fehlgeschlagen");
@@ -307,7 +344,6 @@ function KnobelKasse() {
 
   // 2. DATA LOAD & SYNC
   useEffect(() => {
-    // Prüfe ob Backup existiert
     if(localStorage.getItem('knobel_backup_members')) setLocalBackupAvailable(true);
 
     if ((!user && !isDemo) || !db) return;
@@ -317,17 +353,16 @@ function KnobelKasse() {
         return;
     }
 
-    // KONSTRUIERE NAMEN MIT RAUM-SUFFIX
     const suffix = roomSuffix ? `_${roomSuffix}` : '';
     addLog(`Lade Raum: Standard${suffix}`);
 
-    const getPath = (baseName) => collection(db, 'artifacts', systemAppId, 'public', 'data', `${baseName}${suffix}`);
+    // NUTZE HELPER FUNCTION FÜR PFAD
+    const getPath = (baseName) => getCollectionPath(db, baseName, suffix);
 
     const safeSnapshot = (baseName, setter) => {
       return onSnapshot(getPath(baseName), (snap) => {
           const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
           
-          // Sortierung
           if (baseName.includes('members')) data.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
           if (baseName.includes('history')) {
              data.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
@@ -346,12 +381,10 @@ function KnobelKasse() {
         (err) => {
             console.error(`Read Error ${baseName}:`, err);
             addLog(`Lese-Fehler: ${err.code}`);
-            
-            // PRÜFUNG: Sind Regeln falsch?
             if (err.code === 'permission-denied') {
                 setConfigWarning({
                     title: "Keine Rechte",
-                    msg: "Die Datenbank ist gesperrt. Klicke auf 'Lobby' -> 'System-Check' für Details.",
+                    msg: "Datenbank gesperrt oder Pfad falsch. Mach den System-Check.",
                     code: err.code
                 });
                 setIsDemo(true);
@@ -397,7 +430,8 @@ function KnobelKasse() {
       // Nur Mitglieder hochladen als Beispiel
       bMembers.forEach(m => {
           if(!members.find(ex => ex.name === m.name)) {
-             const ref = doc(collection(db, 'artifacts', systemAppId, 'public', 'data', `knobel_members${suffix}`));
+             // NUTZE HELPER
+             const ref = doc(getCollectionPath(db, 'knobel_members', suffix));
              batch.set(ref, { name: m.name, debt: m.debt || 0, createdAt: serverTimestamp() });
           }
       });
@@ -412,10 +446,6 @@ function KnobelKasse() {
   };
 
   // 3. WRITE ACTIONS
-  // Wir nutzen hier auch den Suffix!
-  const getCol = (name) => collection(db, 'artifacts', systemAppId, 'public', 'data', `${name}${roomSuffix ? `_${roomSuffix}` : ''}`);
-  const getDocRef = (name, id) => doc(db, 'artifacts', systemAppId, 'public', 'data', `${name}${roomSuffix ? `_${roomSuffix}` : ''}`, id);
-
   const safeWrite = async (opName, fn) => {
       setWriteError(null);
       if (isDemo) {
@@ -439,7 +469,6 @@ function KnobelKasse() {
              setIsDemo(true);
              loadLocalData();
           } else {
-             // Andere Fehler
              setIsDemo(true); 
              loadLocalData(); 
           }
@@ -456,47 +485,50 @@ function KnobelKasse() {
   };
 
   // --- ACTIONS ---
-  
+  // Verwende jetzt die Helper-Funktionen für Docs
+  const getMyDoc = (col, id) => getDocumentPath(db, col, id, roomSuffix ? `_${roomSuffix}` : '');
+  const getMyCol = (col) => getCollectionPath(db, col, roomSuffix ? `_${roomSuffix}` : '');
+
   const bookPenalty = (mId, mName, title, amount, cId) => safeWrite('Strafe', async () => {
-    if (isDemo) { /* Local Logic omitted for brevity, assumes Online first */ return; }
-    await updateDoc(getDocRef('knobel_members', mId), { debt: increment(amount) });
-    if (cId) await updateDoc(getDocRef('knobel_catalog', cId), { count: increment(1) });
-    await addDoc(getCol('knobel_history'), { text: `${mName}: ${title}`, amount, type: 'penalty', createdAt: serverTimestamp() });
+    if (isDemo) { return; }
+    await updateDoc(getMyDoc('knobel_members', mId), { debt: increment(amount) });
+    if (cId) await updateDoc(getMyDoc('knobel_catalog', cId), { count: increment(1) });
+    await addDoc(getMyCol('knobel_history'), { text: `${mName}: ${title}`, amount, type: 'penalty', createdAt: serverTimestamp() });
   });
 
   const payDebt = (mId, mName, amount) => safeWrite('Zahlung', async () => {
-    await updateDoc(getDocRef('knobel_members', mId), { debt: increment(-amount) });
-    await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(amount) }, { merge: true });
-    await addDoc(getCol('knobel_history'), { text: `${mName} Einzahlung`, amount: -amount, type: 'payment', createdAt: serverTimestamp() });
+    await updateDoc(getMyDoc('knobel_members', mId), { debt: increment(-amount) });
+    await setDoc(getMyDoc('knobel_pot', 'main'), { balance: increment(amount) }, { merge: true });
+    await addDoc(getMyCol('knobel_history'), { text: `${mName} Einzahlung`, amount: -amount, type: 'payment', createdAt: serverTimestamp() });
   });
 
   const bookExpense = (title, amount) => safeWrite('Ausgabe', async () => {
-      await setDoc(getDocRef('knobel_pot', 'main'), { balance: increment(-amount) }, { merge: true });
-      await addDoc(getCol('knobel_history'), { text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: serverTimestamp() });
+      await setDoc(getMyDoc('knobel_pot', 'main'), { balance: increment(-amount) }, { merge: true });
+      await addDoc(getMyCol('knobel_history'), { text: `Ausgabe: ${title}`, amount: -amount, type: 'expense', createdAt: serverTimestamp() });
   });
 
   const handleAddMember = (name) => safeWrite('Neues Mitglied', async () => {
-      await addDoc(getCol('knobel_members'), { name, debt: 0, createdAt: serverTimestamp() });
+      await addDoc(getMyCol('knobel_members'), { name, debt: 0, createdAt: serverTimestamp() });
   });
 
   const handleDeleteMember = (id) => safeWrite('Löschen', async () => {
-      await deleteDoc(getDocRef('knobel_members', id));
+      await deleteDoc(getMyDoc('knobel_members', id));
   });
 
   const handleAddCatalog = (title, amount) => safeWrite('Neuer Eintrag', async () => {
-      await addDoc(getCol('knobel_catalog'), { title, amount, createdAt: serverTimestamp(), count: 0 });
+      await addDoc(getMyCol('knobel_catalog'), { title, amount, createdAt: serverTimestamp(), count: 0 });
   });
 
   const handleDeleteCatalog = (id) => safeWrite('Löschen', async () => {
-      await deleteDoc(getDocRef('knobel_catalog', id));
+      await deleteDoc(getMyDoc('knobel_catalog', id));
   });
 
   const handleAddEvent = (date, time, location) => safeWrite('Neuer Termin', async () => {
-      await addDoc(getCol('knobel_events'), { date, time, location, createdAt: serverTimestamp() });
+      await addDoc(getMyCol('knobel_events'), { date, time, location, createdAt: serverTimestamp() });
   });
 
   const handleDeleteEvent = (id) => safeWrite('Löschen', async () => {
-      await deleteDoc(getDocRef('knobel_events', id));
+      await deleteDoc(getMyDoc('knobel_events', id));
   });
 
   const handleAdminLogin = (e) => {
