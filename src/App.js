@@ -58,26 +58,33 @@ import {
   Cloud, 
   Activity,
   Save,
-  Database
+  Database,
+  AlertTriangle
 } from 'lucide-react';
 
 // ==========================================
-// 1. KONFIGURATION
+// 1. DEINE FIREBASE KONFIGURATION
 // ==========================================
+// 🔴 WICHTIG: Ersetze diesen Block unten mit deinen eigenen Daten von der Firebase Console!
+// (Projektübersicht -> Zahnrad -> Projekteinstellungen -> Allgemein -> "Deine Apps" -> SDK-Setup und Konfiguration)
 
 const manualConfig = {
+  // --- HIER DEINE EIGENEN DATEN EINFÜGEN ---
   apiKey: "AIzaSyD7iO59TiZVG8vhHpapmpO-IHID8jX_dzE",
   authDomain: "specialized-4b4c4.firebaseapp.com",
   projectId: "specialized-4b4c4",
   storageBucket: "specialized-4b4c4.firebasestorage.app",
   messagingSenderId: "610305729554",
   appId: "1:610305729554:web:081b81ebb26dbf57e7a4cb"
+  // -----------------------------------------
 };
 
+// Logik zur Initialisierung
 let app, auth, db, configError;
 
 try {
   let firebaseConfig = manualConfig;
+  // Fallback für die Vorschau-Umgebung hier im Chat (bitte nicht löschen)
   if (typeof __firebase_config !== 'undefined' && __firebase_config) {
     try {
       firebaseConfig = JSON.parse(__firebase_config);
@@ -93,7 +100,7 @@ try {
   configError = e.message;
 }
 
-// SYSTEM-ID (Darf nicht geändert werden für Schreibrechte!)
+// SYSTEM-ID (Standard für eigene Projekte: 'default-lobby')
 const systemAppId = typeof __app_id !== 'undefined' ? __app_id : 'knobelkasse-default-lobby';
 
 // ==========================================
@@ -163,6 +170,7 @@ function KnobelKasse() {
   const [writeError, setWriteError] = useState(null);
   const [showDebug, setShowDebug] = useState(false);
   const [localBackupAvailable, setLocalBackupAvailable] = useState(false);
+  const [configWarning, setConfigWarning] = useState(false);
   
   // RAUM LOGIK (Suffix basierend)
   const [roomSuffix, setRoomSuffix] = useState(() => {
@@ -186,6 +194,17 @@ function KnobelKasse() {
   // Logs
   const [logs, setLogs] = useState([]);
   const addLog = (msg) => setLogs(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 20));
+
+  // CHECK CONFIG STATUS
+  useEffect(() => {
+    // Wenn wir nicht in der originalen Umgebung sind, aber noch die Demo-Projekt-ID nutzen:
+    const isOriginalEnv = window.location.hostname.includes('googleusercontent') || window.location.hostname.includes('localhost');
+    const isUsingDemoConfig = manualConfig.projectId === "specialized-4b4c4";
+    
+    if (!isOriginalEnv && isUsingDemoConfig) {
+       setConfigWarning(true);
+    }
+  }, []);
 
   // 1. AUTH
   useEffect(() => {
@@ -260,7 +279,7 @@ function KnobelKasse() {
             console.error(`Read Error ${baseName}:`, err);
             addLog(`Lese-Fehler: ${err.message}`);
             if (err.code === 'permission-denied') {
-                setWriteError("Zugriff verweigert! Wechsel in Offline-Modus.");
+                setWriteError("Keine Schreibrechte! Offline-Modus aktiv.");
                 setIsDemo(true);
             }
         }
@@ -335,6 +354,11 @@ function KnobelKasse() {
           console.error("Write Error:", e);
           setWriteError(`Fehler beim Speichern! (${opName})`);
           addLog(`Error: ${e.message}`);
+          
+          if (e.code === 'permission-denied') {
+             setConfigWarning(true);
+          }
+
           // FALLBACK: Wir speichern es LOKAL, damit es nicht verloren geht
           setIsDemo(true); // Switch to offline to protect data
           loadLocalData(); // Reload local state
@@ -446,6 +470,25 @@ function KnobelKasse() {
           </div>
       )}
 
+       {/* CONFIG WARNING BANNER */}
+       {configWarning && (
+          <div className="bg-amber-500 text-white p-4 font-bold text-sm shadow-xl z-50 fixed top-20 left-4 right-4 rounded-xl border-2 border-amber-300">
+              <div className="flex items-center gap-2 mb-2">
+                 <AlertTriangle className="w-6 h-6 text-white" />
+                 <h3 className="uppercase tracking-wider">Setup Unvollständig</h3>
+              </div>
+              <p className="mb-3 font-normal text-amber-50">
+                  Du nutzt noch die Demo-Datenbank. Deshalb wird nichts gespeichert.
+              </p>
+              <div className="text-xs bg-black/20 p-2 rounded mb-2 font-mono">
+                  1. Erstelle Projekt auf console.firebase.google.com<br/>
+                  2. Kopiere die Config in App.jsx (Zeile 60)<br/>
+                  3. Setze Firestore Rules auf "Test Mode"
+              </div>
+              <button onClick={() => setConfigWarning(false)} className="bg-white text-amber-600 px-4 py-2 rounded text-xs font-bold w-full">Verstanden</button>
+          </div>
+      )}
+
       {/* RESTORE PROMPT (Wenn DB leer aber Backup da) */}
       {!isDemo && members.length === 0 && localBackupAvailable && (
           <div className="bg-blue-600 text-white p-4 text-center font-bold text-sm shadow-xl z-40 animate-in slide-in-from-top fixed top-24 left-4 right-4 rounded-xl">
@@ -458,7 +501,7 @@ function KnobelKasse() {
       )}
 
       {/* OFFLINE BANNER */}
-      {isDemo && (
+      {isDemo && !configWarning && (
           <div className="bg-amber-500 text-white px-4 py-2 text-center text-xs font-bold shadow-md flex justify-between items-center z-40 relative">
               <span className="flex items-center gap-1"><Info className="w-4 h-4"/> Offline Modus</span>
           </div>
