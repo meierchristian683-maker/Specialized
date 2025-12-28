@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { initializeApp } from 'firebase/app';
 import { 
-  getFirestore, 
+  getFirestore,
+  initializeFirestore, // WICHTIG: Neu importiert für spezielle Einstellungen
   collection, 
   addDoc, 
   onSnapshot, 
@@ -93,7 +94,17 @@ try {
   }
   app = initializeApp(firebaseConfig);
   auth = getAuth(app);
-  db = getFirestore(app);
+  
+  // FIX: Wir erzwingen 'Long Polling'. Das ist robuster gegen Firewalls/AdBlocker als WebSockets.
+  try {
+    db = initializeFirestore(app, {
+      experimentalForceLongPolling: true, 
+    });
+  } catch (e) {
+    // Falls initializeFirestore fehlschlägt (z.B. bei Hot-Reload), Fallback nutzen
+    db = getFirestore(app);
+  }
+
 } catch (e) {
   console.error("Firebase Init Error:", e);
   configError = e.message;
@@ -248,7 +259,7 @@ function KnobelKasse() {
           } catch (e) {
               if (e.message === "Timeout") {
                  addStep("Datenbank Schreiben", "ERROR", "Zeitüberschreitung (Timeout)");
-                 addStep("MÖGLICHE URSACHE", "WARN", "Firewall oder AdBlocker blockiert 'firestore.googleapis.com'.");
+                 addStep("MÖGLICHE URSACHE", "WARN", "Wir haben jetzt auf 'Long Polling' umgestellt. Bitte App neu laden!");
               } else {
                  addStep("Datenbank Schreiben", "ERROR", `Fehler: ${e.code}`);
                  if (e.code === 'permission-denied') {
