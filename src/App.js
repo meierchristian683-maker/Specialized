@@ -95,10 +95,12 @@ try {
   app = initializeApp(firebaseConfig);
   auth = getAuth(app);
   
-  // FIX: Wir erzwingen 'Long Polling'. Das ist robuster gegen Firewalls/AdBlocker als WebSockets.
+  // FIX: Wir erzwingen 'Long Polling' UND deaktivieren Fetch-Streams.
+  // Das ist die robusteste Einstellung gegen Firewalls und Proxies.
   try {
     db = initializeFirestore(app, {
-      experimentalForceLongPolling: true, 
+      experimentalForceLongPolling: true,
+      useFetchStreams: false, // Hilft bei strikten Proxies
     });
   } catch (e) {
     // Falls initializeFirestore fehlschlägt (z.B. bei Hot-Reload), Fallback nutzen
@@ -243,13 +245,13 @@ function KnobelKasse() {
           }
 
           // Schritt 3: DB Write
-          addStep("Datenbank Schreiben", "PENDING", "Versuche Test-Eintrag (Timeout 5s)...");
+          addStep("Datenbank Schreiben", "PENDING", "Versuche Test-Eintrag (Timeout 10s)...");
           try {
               const testRef = doc(collection(db, 'connection_test'), 'ping_' + Date.now());
               
               // Race condition: Write vs Timeout
               const writePromise = setDoc(testRef, { timestamp: serverTimestamp(), test: "OK" });
-              const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 5000));
+              const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 10000));
               
               await Promise.race([writePromise, timeoutPromise]);
               
@@ -259,7 +261,7 @@ function KnobelKasse() {
           } catch (e) {
               if (e.message === "Timeout") {
                  addStep("Datenbank Schreiben", "ERROR", "Zeitüberschreitung (Timeout)");
-                 addStep("MÖGLICHE URSACHE", "WARN", "Wir haben jetzt auf 'Long Polling' umgestellt. Bitte App neu laden!");
+                 addStep("DIAGNOSE", "WARN", "Dein Netzwerk blockiert Google. Teste mal mobile Daten (WLAN aus)!");
               } else {
                  addStep("Datenbank Schreiben", "ERROR", `Fehler: ${e.code}`);
                  if (e.code === 'permission-denied') {
