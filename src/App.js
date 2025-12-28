@@ -59,7 +59,8 @@ import {
   Activity,
   Save,
   Database,
-  AlertTriangle
+  AlertTriangle,
+  Terminal
 } from 'lucide-react';
 
 // ==========================================
@@ -165,7 +166,7 @@ function KnobelKasse() {
   const [writeError, setWriteError] = useState(null);
   const [showDebug, setShowDebug] = useState(false);
   const [localBackupAvailable, setLocalBackupAvailable] = useState(false);
-  const [configWarning, setConfigWarning] = useState(false);
+  const [configWarning, setConfigWarning] = useState(null);
   
   // RAUM LOGIK (Suffix basierend)
   const [roomSuffix, setRoomSuffix] = useState(() => {
@@ -195,14 +196,36 @@ function KnobelKasse() {
     const initAuth = async () => {
       try {
         await setPersistence(auth, browserLocalPersistence);
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-            await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-            await signInAnonymously(auth);
+        let u = auth.currentUser;
+        if (!u) {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                const cred = await signInWithCustomToken(auth, __initial_auth_token);
+                u = cred.user;
+            } else {
+                // Versuche Anonymen Login - WICHTIGSTER PUNKT
+                addLog("Versuche Anonymen Login...");
+                const cred = await signInAnonymously(auth);
+                u = cred.user;
+            }
         }
+        setUser(u);
+        setIsDemo(false);
+        addLog(`Erfolg: Angemeldet (${u.uid.slice(0,4)}...)`);
       } catch (err) {
         console.error("Auth Fail:", err);
-        setWriteError("Anmeldung fehlgeschlagen. Offline Modus.");
+        addLog(`Auth Fehler: ${err.code}`);
+        
+        // PRÜFUNG: Ist Auth in der Console deaktiviert?
+        if (err.code === 'auth/operation-not-allowed' || err.code === 'auth/admin-restricted-operation') {
+            setConfigWarning({
+                title: "Login Deaktiviert",
+                msg: "Du musst 'Anonyme Anmeldung' in der Firebase Console unter Authentication aktivieren!",
+                code: err.code
+            });
+        } else {
+            setWriteError(`Login Fehler: ${err.message}`);
+        }
+        
         setIsDemo(true); 
       }
     };
@@ -211,7 +234,6 @@ function KnobelKasse() {
         if (u) {
             setUser(u);
             setIsDemo(false);
-            addLog(`Online als: ${u.uid.slice(0,4)}...`);
         }
     });
   }, []);
@@ -229,12 +251,9 @@ function KnobelKasse() {
     }
 
     // KONSTRUIERE NAMEN MIT RAUM-SUFFIX
-    // Wenn roomSuffix leer ist -> "knobel_members"
-    // Wenn roomSuffix "Club" ist -> "knobel_members_Club"
     const suffix = roomSuffix ? `_${roomSuffix}` : '';
     addLog(`Lade Raum: Standard${suffix}`);
 
-    // Helper: Pfad zur Collection (Immer System-ID nutzen!)
     const getPath = (baseName) => collection(db, 'artifacts', systemAppId, 'public', 'data', `${baseName}${suffix}`);
 
     const safeSnapshot = (baseName, setter) => {
@@ -246,7 +265,6 @@ function KnobelKasse() {
           if (baseName.includes('history')) {
              data.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
              setter(data); 
-             // Auto-Backup bei jedem Update
              localStorage.setItem(`knobel_backup_${baseName}`, JSON.stringify(data));
              return;
           }
@@ -256,18 +274,21 @@ function KnobelKasse() {
           }
           
           setter(data);
-          // Auto-Backup
           localStorage.setItem(`knobel_backup_${baseName}`, JSON.stringify(data));
         },
         (err) => {
             console.error(`Read Error ${baseName}:`, err);
-            addLog(`Lese-Fehler: ${err.message}`);
+            addLog(`Lese-Fehler: ${err.code}`);
+            
+            // PRÜFUNG: Sind Regeln falsch?
             if (err.code === 'permission-denied') {
-                setWriteError("Keine Schreibrechte! Offline-Modus aktiv.");
-                // Wenn wir "permission-denied" bekommen, zeigen wir den Config-Warning-Banner an, 
-                // da dies bedeutet, dass die DB existiert, aber gesperrt ist.
-                setConfigWarning(true);
+                setConfigWarning({
+                    title: "Keine Rechte",
+                    msg: "Die Datenbank ist gesperrt. Ändere die 'Rules' in Firestore auf 'allow read, write: if true;'",
+                    code: err.code
+                });
                 setIsDemo(true);
+                loadLocalData();
             }
         }
       );
@@ -343,7 +364,11 @@ function KnobelKasse() {
           addLog(`Error: ${e.message}`);
           
           if (e.code === 'permission-denied') {
-             setConfigWarning(true);
+             setConfigWarning({
+                 title: "Keine Schreibrechte",
+                 msg: "Du darfst nicht schreiben. Prüfe die Firestore Rules.",
+                 code: e.code
+             });
              setIsDemo(true);
              loadLocalData();
           } else {
@@ -464,18 +489,15 @@ function KnobelKasse() {
           <div className="bg-amber-500 text-white p-4 font-bold text-sm shadow-xl z-50 fixed top-20 left-4 right-4 rounded-xl border-2 border-amber-300">
               <div className="flex items-center gap-2 mb-2">
                  <AlertTriangle className="w-6 h-6 text-white" />
-                 <h3 className="uppercase tracking-wider">Datenbank Gesperrt</h3>
+                 <h3 className="uppercase tracking-wider">{configWarning.title}</h3>
               </div>
               <p className="mb-3 font-normal text-amber-50">
-                  Verbindung erfolgreich, aber keine Schreibrechte.
+                  {configWarning.msg}
               </p>
               <div className="text-xs bg-black/20 p-2 rounded mb-2 font-mono">
-                  Lösung:<br/>
-                  1. Öffne console.firebase.google.com<br/>
-                  2. Gehe zu Firestore Database -&gt; Regeln<br/>
-                  3. Setze 'allow read, write: if true;'
+                  Fehler-Code: {configWarning.code}
               </div>
-              <button onClick={() => setConfigWarning(false)} className="bg-white text-amber-600 px-4 py-2 rounded text-xs font-bold w-full">Verstanden</button>
+              <button onClick={() => setConfigWarning(null)} className="bg-white text-amber-600 px-4 py-2 rounded text-xs font-bold w-full">Verstanden</button>
           </div>
       )}
 
@@ -543,7 +565,7 @@ function KnobelKasse() {
                 <button onClick={() => setShowDebug(false)} className="absolute top-2 right-2 p-2 text-slate-400 hover:text-slate-600"><X className="w-5 h-5"/></button>
                 
                 <h3 className="font-bold text-lg mb-4 flex items-center gap-2 text-slate-800">
-                    <Settings className="w-5 h-5"/> Einstellungen
+                    <Terminal className="w-5 h-5"/> System Logs
                 </h3>
                 
                 <div className="space-y-4 text-sm">
@@ -551,9 +573,6 @@ function KnobelKasse() {
                     {/* ROOM SELECTOR */}
                     <div className="bg-amber-50 p-4 rounded-xl border border-amber-200">
                         <label className="text-xs uppercase font-bold text-amber-700 block mb-2">Dein Raum-Name</label>
-                        <p className="text-xs text-amber-800/70 mb-3">
-                            Damit alle dasselbe sehen: Gib hier auf allen Handys das gleiche Wort ein (z.B. "Kegelclub").
-                        </p>
                         <form onSubmit={changeRoom} className="flex gap-2">
                             <input 
                                 className="flex-1 p-2 rounded border border-amber-300 text-sm outline-none focus:border-amber-500 bg-white" 
@@ -573,20 +592,15 @@ function KnobelKasse() {
                         )}
                     </div>
 
-                    <div className="bg-slate-900 text-slate-300 p-3 rounded-lg border border-slate-700 h-32 overflow-y-auto font-mono text-[10px]">
+                    <div className="bg-slate-900 text-slate-300 p-3 rounded-lg border border-slate-700 h-48 overflow-y-auto font-mono text-[10px]">
                         {logs.length === 0 && <div className="text-slate-600 italic">Keine Logs...</div>}
-                        {logs.map((l, i) => <div key={i} className="border-b border-slate-800 last:border-0 pb-1 mb-1">{l}</div>)}
+                        {logs.map((l, i) => <div key={i} className="border-b border-slate-800 last:border-0 pb-1 mb-1 break-all">{l}</div>)}
                     </div>
 
                     <div className="flex gap-2 mt-2">
                         <button onClick={() => window.location.reload()} className="flex-1 bg-slate-200 hover:bg-slate-300 text-slate-700 py-3 rounded-lg font-bold text-xs transition-colors flex items-center justify-center gap-2">
                             <RefreshCw className="w-4 h-4" /> App neu laden
                         </button>
-                        {localBackupAvailable && (
-                            <button onClick={restoreBackup} className="px-4 bg-blue-100 text-blue-700 hover:bg-blue-200 py-3 rounded-lg font-bold text-xs transition-colors">
-                                Backup laden
-                            </button>
-                        )}
                     </div>
                 </div>
             </div>
